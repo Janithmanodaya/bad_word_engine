@@ -333,7 +333,7 @@ def load_custom_words_from_env() -> Tuple[Set[str], Set[str], Set[str]]:
     return en, si, si_sing
 
 
-def build_automaton(words: Set[str]) -> Optional[ahocorasick.Automaton]:
+def build_automaton(words: Set[str]) -> Optional[object]:
     if not HAS_AHO:
         return None
     A = ahocorasick.Automaton()
