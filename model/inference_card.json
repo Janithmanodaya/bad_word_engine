@@ -1,0 +1,15 @@
+{
+  "base_model": "microsoft/Multilingual-MiniLM-L12-H384",
+  "model_path": "outputs/gemma-badwords-qlora",
+  "task": "sequence-classification",
+  "labels": [
+    0,
+    1
+  ],
+  "text_column": "text",
+  "label_column": "label",
+  "max_length": 64,
+  "notes": "This is a compact classifier fine-tuned for bad-word detection (no LoRA/quant).",
+  "train_seconds": 108.92,
+  "preset": "small_cls"
+}
