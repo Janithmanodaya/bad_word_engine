@@ -32,11 +32,12 @@ import sys
 import subprocess
 import importlib.util
 import urllib.request
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import shutil
 import time
 import logging
 from collections import defaultdict
+import threading
 
 # ---------------------------
 # Colab detection
@@ -55,10 +56,8 @@ def in_colab() -> bool:
 
 REQUIRED_PKGS = [
     "numpy",
-    # Transformers/PEFT stack
+    # Transformers stack (small classifier only)
     "transformers>=4.43",
-    "peft",
-    "bitsandbytes",
     "datasets",
     "accelerate",
     "evaluate",
@@ -145,21 +144,33 @@ from transformers import (
     AutoTokenizer,
     AutoConfig,
     AutoModelForSequenceClassification,
-    BitsAndBytesConfig,
     DataCollatorWithPadding,
     Trainer,
     TrainingArguments,
     set_seed,
+    TrainerCallback,
 )
 from transformers.utils import logging as hf_logging
-from peft import (
-    LoraConfig,
-    TaskType,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-)
+from transformers.trainer_utils import get_last_checkpoint
 from huggingface_hub import login as hf_login
 from huggingface_hub.errors import GatedRepoError
+
+# ---------------------------
+# Torch perf knobs (use max available resources)
+# ---------------------------
+try:
+    import torch.backends.cudnn as cudnn  # type: ignore
+    cudnn.benchmark = True
+except Exception:
+    pass
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True  # Ampere+ TF32 fast matmul
+except Exception:
+    pass
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
 
 # ---------------------------
 # Wordlist utilities
@@ -167,6 +178,8 @@ from huggingface_hub.errors import GatedRepoError
 
 DEFAULT_BADWORDS_REPO = "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master"
 DEFAULT_CLEANWORDS_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt"
+
+
 
 # Simple download event log for clear PASS/FAIL reporting
 DOWNLOAD_EVENTS: List[dict] = []
@@ -199,11 +212,11 @@ def _summarize_downloads() -> None:
             logging.info(f"  [{status}] {e['url']}{extra}")
     logging.info("=" * 70)
 
-def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO) -> List[str]:
+def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO, si_overrides: Optional[List[str]] = None) -> List[str]:
     """
     Download bad words for the given language codes.
     - For 'en': use LDNOOBW (try both with/without .txt).
-    - For 'si': LDNOOBW doesn't host Sinhala; pull from MRVLS unicode + singlish lists and known mirrors.
+    - For 'si': STRICT mode — only use URLs provided via si_overrides; if none provided or all fail, raise an error.
     """
     bad: List[str] = []
 
@@ -228,15 +241,15 @@ def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO)
             continue
 
         if lang == "si":
-            # Primary sources: MRVLS Sinhala lists (unicode + singlish)
-            candidates = [
-                # Unicode Sinhala bad words
-                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-unicode.txt",
-                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-unicode.txt",
-                # Singlish transliteration
-                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-singlish.txt",
-                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-singlish.txt",
-            ]
+            # STRICT: require explicit Sinhala URLs; do not use mirrors or built-ins
+            candidates = []
+            if si_overrides:
+                for u in si_overrides:
+                    u = u.strip()
+                    if u:
+                        candidates.append(u)
+            if not candidates:
+                raise RuntimeError("Sinhala wordlist requested but no URLs provided. Set --si_wordlist_urls with one or more sources.")
             got_any = False
             for u in candidates:
                 lines = _fetch_lines("badwords:si", u)
@@ -244,7 +257,7 @@ def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO)
                     bad.extend(lines)
                     got_any = True
             if not got_any:
-                logging.warning("[wordlist] No Sinhala lists were fetched; will rely on built-in minimal set later.")
+                raise RuntimeError("Sinhala wordlist URLs provided, but none could be fetched. Please verify the URLs or availability.")
             continue
 
         # English and other languages via LDNOOBW
@@ -429,6 +442,32 @@ class WeightedTrainer(Trainer):
         loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
 
+
+# ---------------------------
+# Callback to delay evaluation
+# ---------------------------
+
+class DelayedEvalCallback(TrainerCallback):
+    def __init__(self, start_step: int = 0, start_epoch: float = 0.0):
+        self.start_step = int(start_step or 0)
+        self.start_epoch = float(start_epoch or 0.0)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        try:
+            if state.global_step is not None and state.global_step < self.start_step:
+                control.should_evaluate = False
+        except Exception:
+            pass
+        return control
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        try:
+            if state.epoch is not None and state.epoch < self.start_epoch:
+                control.should_evaluate = False
+        except Exception:
+            pass
+        return control
+
 # ---------------------------
 # Data module
 # ---------------------------
@@ -478,34 +517,130 @@ def build_dataset(path: str, text_col: str, label_col: str, seed: int, val_size:
     return ds
 
 
-def build_sold_dataset(seed: int, val_size: float) -> DatasetDict:
+def build_sold_dataset(
+    seed: int,
+    val_size: float,
+    train_path: Optional[str] = None,
+    test_path: Optional[str] = None,
+    trial_path: Optional[str] = None,
+    parquet_train_api: Optional[str] = None,
+    parquet_test_api: Optional[str] = None,
+) -> DatasetDict:
     """
-    Load SOLD (Sinhala Offensive Language Dataset) from Hugging Face and return a DatasetDict
-    with 'train' and 'validation' splits. Columns used: text (features) and label (targets).
+    Load SOLD (Sinhala Offensive Language Dataset).
+    Preferred: Hugging Face hub 'sinhala-nlp/SOLD'.
+    Fallback order:
+      1) Remote parquet files obtained via Hugging Face API endpoints
+      2) Local TSV files
+    Returns DatasetDict with 'train' and 'validation' splits and normalized columns 'text'/'label'.
     """
-    logging.info("[SOLD] Loading 'sinhala-nlp/SOLD' from Hugging Face hub")
-    raw = load_dataset("sinhala-nlp/SOLD")
-    # Prefer official train/test; fall back to creating a split if necessary
-    if isinstance(raw, dict):
-        if "train" in raw and "test" in raw:
-            ds = DatasetDict({"train": raw["train"], "validation": raw["test"]})
-        elif "train" in raw and "validation" in raw:
-            ds = DatasetDict({"train": raw["train"], "validation": raw["validation"]})
+    logging.info("[SOLD] Attempting to load 'sinhala-nlp/SOLD' from Hugging Face hub")
+    ds: Optional[DatasetDict] = None
+    try:
+        raw = load_dataset("sinhala-nlp/SOLD")
+        # Prefer official train/test; fall back to creating a split if necessary
+        if isinstance(raw, dict):
+            if "train" in raw and "test" in raw:
+                ds = DatasetDict({"train": raw["train"], "validation": raw["test"]})
+            elif "train" in raw and "validation" in raw:
+                ds = DatasetDict({"train": raw["train"], "validation": raw["validation"]})
+            else:
+                base = list(raw.values())[0]
+                split = base.train_test_split(test_size=val_size, seed=seed)
+                ds = DatasetDict({"train": split["train"], "validation": split["test"]})
         else:
-            # Single split present; create validation
-            base = list(raw.values())[0]
-            split = base.train_test_split(test_size=val_size, seed=seed)
+            split = raw.train_test_split(test_size=val_size, seed=seed)
             ds = DatasetDict({"train": split["train"], "validation": split["test"]})
-    else:
-        # Unexpected structure; make a split
-        split = raw.train_test_split(test_size=val_size, seed=seed)
-        ds = DatasetDict({"train": split["train"], "validation": split["test"]})
+        logging.info("[SOLD] Hub dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
+    except Exception as e:
+        logging.warning("[SOLD] Hub load failed: %s. Trying remote parquet fallback.", e)
 
-    # Confirm columns exist
+    # Remote parquet fallback via API endpoints
+    def _fetch_parquet_urls(api_url: str) -> List[str]:
+        urls: List[str] = []
+        try:
+            with urllib.request.urlopen(api_url) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            # Expected structure: list of dicts with 'url' keys
+            # Some endpoints return dicts with 'parquet_files' or similar. Handle both.
+            if isinstance(data, dict):
+                items = data.get("parquet_files") or data.get("urls") or data.get("files") or []
+                if isinstance(items, list):
+                    for item in items:
+                        u = item.get("url") if isinstance(item, dict) else item
+                        if isinstance(u, str) and u:
+                            urls.append(u)
+            elif isinstance(data, list):
+                for item in data:
+                    u = item.get("url") if isinstance(item, dict) else item
+                    if isinstance(u, str) and u:
+                        urls.append(u)
+        except Exception as e:
+            logging.warning("[SOLD] Failed to fetch parquet URLs from API '%s': %s", api_url, e)
+        return urls
+
+    if ds is None and parquet_train_api and parquet_test_api:
+        train_urls = _fetch_parquet_urls(parquet_train_api)
+        test_urls = _fetch_parquet_urls(parquet_test_api)
+        if train_urls and test_urls:
+            try:
+                logging.info("[SOLD] Loading parquet from API URLs (train/test)")
+                raw = load_dataset("parquet", data_files={"train": train_urls, "validation": test_urls})
+                ds = DatasetDict({"train": raw["train"], "validation": raw["validation"]})
+                logging.info("[SOLD] Parquet dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
+            except Exception as e:
+                logging.warning("[SOLD] Parquet load failed: %s. Falling back to local TSV.", e)
+
+    # Local TSV fallback
+    if ds is None:
+        train_p = train_path or "data/SOLD_train.tsv"
+        test_p = test_path or "data/SOLD_test.tsv"
+        trial_p = trial_path or "data/SOLD_trial.tsv"
+
+        def _maybe_load_tsv(path: str, split_name: str):
+            if os.path.exists(path):
+                logging.info("[SOLD] Loading local TSV: %s (%s split)", path, split_name)
+                return load_dataset("csv", data_files={split_name: path}, delimiter="\t")[split_name]
+            else:
+                logging.warning("[SOLD] Local TSV not found: %s", path)
+                return None
+
+        train_split = _maybe_load_tsv(train_p, "train")
+        test_split = _maybe_load_tsv(test_p, "validation")  # map test to validation
+        _ = _maybe_load_tsv(trial_p, "trial")
+
+        if train_split is None:
+            raise FileNotFoundError("[SOLD] Local TSV fallback failed: training file not found.")
+        if test_split is None:
+            logging.info("[SOLD] Validation TSV not found; creating validation split from train at ratio %.2f", val_size)
+            split = train_split.train_test_split(test_size=val_size, seed=seed)
+            ds = DatasetDict({"train": split["train"], "validation": split["test"]})
+        else:
+            ds = DatasetDict({"train": train_split, "validation": test_split})
+
+        logging.info("[SOLD] Local TSV dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
+
+    # Normalize columns to 'text' and 'label' if needed
+    def _guess_columns(column_names: List[str]) -> Tuple[str, str]:
+        text_candidates = ["text", "comment", "sentence", "content"]
+        label_candidates = ["label", "labels", "gold_label", "class", "target"]
+        text_col = next((c for c in text_candidates if c in column_names), None)
+        label_col = next((c for c in label_candidates if c in column_names), None)
+        if not text_col or not label_col:
+            raise ValueError(f"[SOLD] Could not infer textl columns from: {column_names}")
+        return text_col, label_col
+
+    tcol_train, lcol_train = _guess_columns(ds["train"].column_names)
+    tcol_val, lcol_val = _guess_columns(ds["validation"].column_names)
+    if tcol_train != "text" or lcol_train != "label":
+        ds = ds.rename_column(tcol_train, "text").rename_column(lcol_train, "label")
+    if tcol_val != "text" or lcol_val != "label":
+        ds = ds.rename_column(tcol_val, "text").rename_column(lcol_val, "label")
+
+    # Final confirmation
     for col in ("text", "label"):
         if col not in ds["train"].column_names:
             raise ValueError(f"[SOLD] Column '{col}' not found. Available: {ds['train'].column_names}")
-    logging.info("[SOLD] Dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
     return ds
 
 # ---------------------------
@@ -513,13 +648,14 @@ def build_sold_dataset(seed: int, val_size: float) -> DatasetDict:
 # ---------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Self-installing QLoRA trainer for Gemma bad-word classification.")
+    parser = argparse.ArgumentParser(description="Self-installing trainer for compact bad-word classifier (Multilingual MiniLM).")
     parser.add_argument("--dataset_path", type=str, default="data/auto_badwords_en_si.csv", help="Path to CSV/JSON/JSONL with text+label columns.")
     parser.add_argument("--dataset_url", type=str, default=None, help="Optional URL to download dataset if dataset_path is missing.")
     # Auto wordlist options
     parser.add_argument("--auto_wordlists", action="store_true", default=True, help="Build dataset automatically from public word lists.")
     parser.add_argument("--bad_words_langs", type=str, default="en,si", help="Comma-separated languages for bad-word lists (e.g., 'en,si').")
     parser.add_argument("--bad_words_repo_url", type=str, default=DEFAULT_BADWORDS_REPO, help="Base repo URL for bad-word lists.")
+    parser.add_argument("--si_wordlist_urls", type=str, default=os.environ.get("SI_WORDLIST_URLS", ""), help="Comma-separated custom URLs for Sinhala bad-word lists (unicode/singlish). Can also be a local file path containing one URL per line.")
     parser.add_argument("--clean_words_url", type=str, default=DEFAULT_CLEANWORDS_URL, help="URL for clean words list.")
     parser.add_argument("--wordlist_clean_limit", type=int, default=10000, help="Max number of clean words to use.")
     parser.add_argument("--augment_context", action="store_true", default=True, help="Wrap words into short sentences for better generalization.")
@@ -527,7 +663,7 @@ def main():
     # Training/data params
     parser.add_argument("--text_column", type=str, default="text", help="Name of the text column.")
     parser.add_argument("--label_column", type=str, default="label", help="Name of the label column (0/1).")
-    parser.add_argument("--base_model", type=str, default="google/gemma-2-2b-it", help="Base Gemma model to fine-tune.")
+    parser.add_argument("--base_model", type=str, default="microsoft/Multilingual-MiniLM-L12-H384", help="Small classifier base model to fine-tune.")
     parser.add_argument("--output_dir", type=str, default="outputs/gemma-badwords-qlora", help="Where to save LoRA adapter and tokenizer.")
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--num_train_epochs", type=int, default=2)
@@ -539,9 +675,7 @@ def main():
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val_size", type=float, default=0.1)
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    
     parser.add_argument("--save_total_limit", type=int, default=3)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--eval_steps", type=int, default=50)
@@ -549,15 +683,31 @@ def main():
     parser.add_argument("--push_to_hub", action="store_true")
     parser.add_argument("--hub_model_id", type=str, default=None)
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory.")
-    parser.add_argument("--preset", type=str, choices=["base", "low_vram"], default="low_vram", help="Convenience presets for VRAM.")
+    parser.add_argument("--preset", type=str, choices=["small_cls"], default="small_cls", help="Use compact classifier model (no LoRA/4-bit).")
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
     # GPU preference/validation
     parser.add_argument("--require_gpu_name", type=str, default="", help="If set, require that CUDA device name contains this substring (e.g., 'T4').")
     parser.add_argument("--enforce_gpu_name", action="store_true", help="If true and require_gpu_name set, exit if the CUDA device name doesn't match.")
     # Fresh start / cache clearing
     parser.add_argument("--fresh_start", action="store_true", help="Delete output_dir and model/dataset caches before starting.")
+    # Resume options
+    parser.add_argument("--resume", action="store_true", help="Auto-resume from the last checkpoint found in output_dir if available.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint to resume from. If set, overrides --resume.")
+    # Evaluation delay options
+    parser.add_argument("--eval_start_step", type=int, default=0, help="Skip evaluation until this global step is reached.")
+    parser.add_argument("--eval_start_epoch", type=float, default=0.0, help="Skip evaluation until this epoch number is reached.")
+    # Colab keepalive options
+    parser.add_argument("--colab_keepalive", action="store_true", help="Enable a lightweight keepalive thread to reduce Colab idle disconnects.")
+    parser.add_argument("--colab_keepalive_interval", type=int, default=60, help="Keepalive ping interval in seconds (default: 60).")
     # Use SOLD dataset
-    parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub instead of local file/auto wordlists.")
+    parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub. If hub load fails, fallback to remote parquet or local TSV files.")
+    # Remote parquet API endpoints (used if hub fails)
+    parser.add_argument("--sold_parquet_train_api", type=str, default="https://huggingface.co/api/datasets/sinhala-nlp/SOLD/parquet/default/train", help="API endpoint to fetch parquet URLs for SOLD train split.")
+    parser.add_argument("--sold_parquet_test_api", type=str, default="https://huggingface.co/api/datasets/sinhala-nlp/SOLD/parquet/default/test", help="API endpoint to fetch parquet URLs for SOLD test split.")
+    # Local TSV fallback
+    parser.add_argument("--sold_train_path", type=str, default="data/SOLD_train.tsv", help="Local path to SOLD train TSV (fallback).")
+    parser.add_argument("--sold_test_path", type=str, default="data/SOLD_test.tsv", help="Local path to SOLD test TSV as validation (fallback).")
+    parser.add_argument("--sold_trial_path", type=str, default="data/SOLD_trial.tsv", help="Local path to SOLD trial TSV (optional, unused for training).")
     # Auth and fallback
     parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"), help="Hugging Face token for gated models.")
     parser.add_argument("--fallback_model", type=str, default="Qwen/Qwen2-1.5B-Instruct", help="Fallback open model if base model is gated and no token.")
@@ -616,42 +766,84 @@ def main():
     hf_logging.set_verbosity_info()
     hf_logging.enable_default_handler()
     hf_logging.enable_explicit_format()
-    logging.info("Starting Gemma bad-words training")
+    logging.info("Starting bad-words classifier training")
     logging.info(f"Args: {vars(args)}")
 
-    # Apply presets
-    if args.preset == "low_vram" or in_colab():
-        # Lower memory footprint settings
-        if not args.gradient_accumulation_steps or args.gradient_accumulation_steps < 16:
-            args.gradient_accumulation_steps = 16
-        args.per_device_train_batch_size = 1
-        args.per_device_eval_batch_size = 1
-        args.max_length = min(args.max_length, 128)
-        args.gradient_checkpointing = True
-        # Logging/eval cadence better for Colab
-        args.logging_steps = min(args.logging_steps, 5)
-        args.eval_steps = max(args.eval_steps, 100)
-        args.save_steps = max(args.save_steps, 1000)
-        # Slightly lower LR can stabilize with high accumulation
-        args.learning_rate = min(args.learning_rate, 2e-4)
+    # Small classifier mode only (no LoRA/4-bit)
+    small_model = True
+
+    # ---------------------------
+    # Colab keepalive thread
+    # ---------------------------
+    def _colab_keepalive_loop(interval: int):
+        url = "https://clients3.google.com/generate_204"  # 204 response, light ping
+        while True:
+            try:
+                # Small network ping
+                with urllib.request.urlopen(url, timeout=10) as _r:
+                    pass
+                # Emit an invisible heartbeat to stdout to keep I/O active
+                sys.stdout.write("\u200B")
+                sys.stdout.flush()
+            except Exception:
+                # Avoid crashing the thread on transient failures
+                pass
+            time.sleep(max(10, int(interval)))
+
+    if in_colab() and args.colab_keepalive:
+        try:
+            t = threading.Thread(target=_colab_keepalive_loop, args=(args.colab_keepalive_interval,), daemon=True)
+            t.start()
+            logging.info("[colab] Keepalive thread started (interval=%ss).", args.colab_keepalive_interval)
+        except Exception as e:
+            logging.warning("[colab] Failed to start keepalive thread: %s", e)
+
+    # Apply preset for small classifier (no LoRA/4-bit quantization)
+    # Good for multilingual toxicity. Defaults chosen for speed and stability.
+    if args.base_model == "google/gemma-2-2b-it":
+        args.base_model = "microsoft/Multilingual-MiniLM-L12-H384"
+    args.per_device_train_batch_size = max(8, int(args.per_device_train_batch_size or 8))
+    args.per_device_eval_batch_size = max(32, int(args.per_device_eval_batch_size or 32))
+    args.max_length = min(args.max_length, 64)
+    args.gradient_accumulation_steps = max(1, int(args.gradient_accumulation_steps or 1))
+    args.gradient_checkpointing = False
+    args.logging_steps = max(args.logging_steps, 20)
+    args.eval_steps = max(args.eval_steps, 200)
+    args.save_steps = max(args.save_steps, 1000)
+    args.learning_rate = min(args.learning_rate, 5e-4)
 
     # Build dataset from wordlists if requested (skip when using SOLD)
     dataset_path = args.dataset_path
     if not args.use_sold:
         if args.auto_wordlists and (args.regenerate_wordlist or not os.path.exists(dataset_path)):
             langs = [s.strip() for s in args.bad_words_langs.split(",") if s.strip()]
-            bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url)
-            clean_words = download_clean_words(url=args.clean_words_url, limit=args.wordlist_clean_limit)
-            if not bad_words:
-                logging.warning("[wordlist] No bad words downloaded; training may not be meaningful.")
-            if not clean_words:
-                logging.warning("[wordlist] No clean words downloaded; training may not be meaningful.")
-            build_wordlist_dataset_csv(dataset_path, bad_words, clean_words, augment_context=args.augment_context)
-            # Summarize download results for clear verification in logs
-            _summarize_downloads()
+            si_urls_list = None
+            raw_si = (args.si_wordlist_urls or "").strip()
+            if raw_si:
+                # Allow a local file path containing one URL per line, or a comma-separated list directly
+                if os.path.exists(raw_si) and os.path.isfile(raw_si):
+                    with open(raw_si, "r", encoding="utf-8") as f:
+                        si_urls_list = [ln.strip() for ln in f if ln.strip()]
+                else:
+                    si_urls_list = [s.strip() for s in raw_si.split(",") if s.strip()]
+            # STRICT for wordlists, but allow automatic SOLD dataset if URLs not provided
+            if any(l.lower() == "si" for l in langs) and not si_urls_list:
+                logging.info("[wordlist] Sinhala requested but no --si_wordlist_urls provided. Switching to SOLD dataset (hub/parquet/local TSV).")
+                args.use_sold = True
+            if not args.use_sold:
+                bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url, si_overrides=si_urls_list)
+                clean_words = download_clean_words(url=args.clean_words_url, limit=args.wordlist_clean_limit)
+                if not bad_words:
+                    logging.warning("[wordlist] No bad words downloaded; training may not be meaningful.")
+                if not clean_words:
+                    logging.warning("[wordlist] No clean words downloaded; training may not be meaningful.")
+                build_wordlist_dataset_csv(dataset_path, bad_words, clean_words, augment_context=args.augment_context)
+                # Summarize download results for clear verification in logs
+                _summarize_downloads()
 
-        # Dataset presence or download otherwise
-        dataset_path = maybe_download_dataset(dataset_path, args.dataset_url)
+        # Dataset presence or download otherwise (only if still not using SOLD)
+        if not args.use_sold:
+            dataset_path = maybe_download_dataset(dataset_path, args.dataset_url)
 
     # Environment checks
     has_cuda = torch.cuda.is_available()
@@ -685,8 +877,8 @@ def main():
                 "If you still want to attempt CPU training (not recommended; may OOM), pass --force_cpu."
             )
         raise SystemExit(
-            "No CUDA GPU detected. QLoRA with bitsandbytes requires an NVIDIA GPU. "
-            "If you still want to attempt CPU training (not recommended; may OOM), pass --force_cpu."
+            "No CUDA GPU detected. A GPU is strongly recommended for training speed. "
+            "If you still want to attempt CPU training (may be slow), pass --force_cpu."
         )
 
     set_seed(args.seed)
@@ -721,8 +913,16 @@ def main():
 
     # Dataset
     if args.use_sold:
-        ds = build_sold_dataset(seed=args.seed, val_size=args.val_size)
-        # SOLD uses text/label columns by definition
+        ds = build_sold_dataset(
+            seed=args.seed,
+            val_size=args.val_size,
+            train_path=args.sold_train_path,
+            test_path=args.sold_test_path,
+            trial_path=args.sold_trial_path,
+            parquet_train_api=args.sold_parquet_train_api,
+            parquet_test_api=args.sold_parquet_test_api,
+        )
+        # Normalize expected columns
         args.text_column = "text"
         args.label_column = "label"
         logging.info("[SOLD] Using columns text='%s', label='%s'", args.text_column, args.label_column)
@@ -768,29 +968,21 @@ def main():
     collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
 
     # Labels/config
-    num_labels = int(max(int(max(ds["train"][args.label_column])), int(max(ds["validation"][args.label_column])))) + 1
+    try:
+        train_max = int(max(ds["train"][args.label_column]))
+        val_max = int(max(ds["validation"][args.label_column]))
+        num_labels = max(train_max, val_max) + 1
+    except Exception:
+        # Fallback in case of empty dataset or unexpected types
+        num_labels = 2
     config = AutoConfig.from_pretrained(active_model_id, num_labels=num_labels)
 
-    # Model loading (GPU QLoRA vs CPU)
+    # Model loading (small classifier only)
     model_kwargs = {"config": config}
+    # Use float32 weights for stable training and to avoid FP16 scaler issues
     if has_cuda:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=compute_dtype,
-        )
-        # Prefer binding entirely to GPU 0 when available
-        device_map = {"": 0} if torch.cuda.device_count() >= 1 else "auto"
-        model_kwargs.update(
-            dict(
-                quantization_config=bnb_config,
-                torch_dtype=compute_dtype,
-                device_map=device_map,
-            )
-        )
+        model_kwargs.update(dict(torch_dtype=torch.float32, device_map="auto"))
     else:
-        # CPU path (likely OOM for LLMs). No quantization_config.
         model_kwargs.update(dict(torch_dtype=torch.float32))
 
     logging.info(f"Loading base model: {active_model_id}")
@@ -807,29 +999,8 @@ def main():
             model = AutoModelForSequenceClassification.from_pretrained(active_model_id, **model_kwargs)
         else:
             raise
-    logging.info(f"Model loaded. Dtype: {getattr(model, 'dtype', 'mixed')}, gradient_checkpointing={args.gradient_checkpointing}")
-
-    if args.gradient_checkpointing and has_cuda:
-        model.gradient_checkpointing_enable()
-
-    # Prepare for k-bit training and apply LoRA (GPU only)
-    if has_cuda:
-        model = prepare_model_for_kbit_training(model)
-
-    # Typical Llama/Gemma target modules
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-
-    lora_cfg = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=target_modules,
-        bias="none",
-        task_type=TaskType.SEQ_CLS,
-    )
-    logging.info(f"LoRA config: r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, targets={target_modules}")
-
-    model = get_peft_model(model, lora_cfg)
+    logging.info(f"Model loaded. Dtype: {getattr(model, 'dtype', 'mixed')}")
+    logging.info("Small classifier active: training full model head without LoRA or 4-bit quantization.")
 
     # Class weights from training labels
     class_weights = compute_class_weights(list(ds["train"][args.label_column]))
@@ -894,18 +1065,38 @@ def main():
         greater_is_better=True,
         push_to_hub=args.push_to_hub,
         hub_model_id=args.hub_model_id,
+        # Max resource utilization for dataloading
+        dataloader_num_workers=max(1, (os.cpu_count() or 1) // 2),
+        dataloader_pin_memory=True,
+        auto_find_batch_size=True,
+        group_by_length=True,
+        # Avoid gradient clipping interaction with FP16 scaler
+        max_grad_norm=0.0,
     )
     if eval_key:
         training_kwargs[eval_key] = "steps"
     training_kwargs["eval_steps"] = args.eval_steps
 
+    # Explicitly disable gradient checkpointing for small classifier
+    training_kwargs["gradient_checkpointing"] = False
+
     if has_cuda:
         training_kwargs.update(
             dict(
+                # Prefer bf16 on Ampere+, otherwise disable fp16 to avoid GradScaler issues
                 bf16=(compute_dtype == torch.bfloat16),
-                fp16=(compute_dtype == torch.float16),
+                fp16=False,
             )
         )
+
+    # Prefer fused AdamW if available for speed
+    try:
+        _params = inspect.signature(TrainingArguments.__init__).parameters
+        if "optim" in _params:
+            training_kwargs["optim"] = "adamw_torch"
+            logging.info("Using optim='adamw_torch' for potential fused speedups.")
+    except Exception:
+        pass
 
     train_args = TrainingArguments(**training_kwargs)
 
@@ -919,6 +1110,12 @@ def main():
         data_collator=collator,
         compute_metrics=compute_metrics,
     )
+
+    # Register evaluation delay callback if requested
+    if (args.eval_start_step and args.eval_start_step > 0) or (args.eval_start_epoch and args.eval_start_epoch > 0.0):
+        trainer.add_callback(DelayedEvalCallback(start_step=args.eval_start_step, start_epoch=args.eval_start_epoch))
+        logging.info("[eval] Evaluation will be skipped until step >= %s and epoch >= %s", args.eval_start_step, args.eval_start_epoch)
+
 
     # Train
     logging.info("=" * 70)
@@ -941,8 +1138,28 @@ def main():
     logging.info("=" * 70)
 
     logging.info("Beginning training...")
+    # Determine resume path if requested
+    resume_arg = None
+    if args.resume_from_checkpoint:
+        resume_arg = args.resume_from_checkpoint
+        logging.info("[resume] Explicit checkpoint path provided: %s", resume_arg)
+    elif args.resume and not args.fresh_start:
+        try:
+            if os.path.isdir(args.output_dir):
+                last_ckpt = get_last_checkpoint(args.output_dir)
+                if last_ckpt:
+                    resume_arg = last_ckpt
+                    logging.info("[resume] Found last checkpoint in output_dir: %s", resume_arg)
+                else:
+                    logging.info("[resume] No checkpoint found in output_dir: %s", args.output_dir)
+        except Exception as e:
+            logging.warning("[resume] Failed to detect last checkpoint: %s", e)
+
     t0 = time.time()
-    train_result = trainer.train()
+    if resume_arg:
+        train_result = trainer.train(resume_from_checkpoint=resume_arg)
+    else:
+        train_result = trainer.train()
     t1 = time.time()
     logging.info(f"Training finished. Seconds: {round(t1 - t0, 2)}")
     try:
@@ -951,29 +1168,29 @@ def main():
     except Exception:
         pass
 
-    # Save adapter and tokenizer only (small)
+    # Save model and tokenizer
     os.makedirs(args.output_dir, exist_ok=True)
-    logging.info("Saving adapter and tokenizer...")
+    logging.info("Saving model and tokenizer...")
     trainer.model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
     # Export minimal inference card
     card = {
         "base_model": active_model_id,
-        "adapter_path": args.output_dir,
+        "model_path": args.output_dir,
         "task": "sequence-classification",
         "labels": list(range(num_labels)),
         "text_column": args.text_column,
         "label_column": args.label_column,
         "max_length": args.max_length,
-        "notes": "Load base model in 4-bit (GPU) and merge with this adapter for bad-word classification.",
+        "notes": "This is a compact classifier fine-tuned for bad-word detection (no LoRA/quant).",
         "train_seconds": round(t1 - t0, 2),
         "preset": args.preset,
     }
     with open(os.path.join(args.output_dir, "inference_card.json"), "w", encoding="utf-8") as f:
         json.dump(card, f, indent=2)
 
-    print(f"Training complete in {round(t1 - t0, 2)}s. Adapter saved to: {args.output_dir}")
+    print(f"Training complete in {round(t1 - t0, 2)}s. Model saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":
