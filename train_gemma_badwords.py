@@ -1,39 +1,102 @@
 #!/usr/bin/env python3
 """
-QLoRA fine-tuning script for bad-word classification using Google Gemma.
+Self-bootstrapping QLoRA trainer for bad-word classification on Google Gemma.
 
-- Uses 4-bit quantization (bitsandbytes) to fit large models on a single GPU
-- Applies PEFT LoRA adapters only to attention/MLP matrices (memory efficient)
-- Works with CSV/JSON/JSONL datasets
-- Handles class imbalance via weighted cross-entropy
-- Saves only the LoRA adapter by default (tiny footprint)
-- Sensible defaults for resource-constrained setups
+Key features:
+- One-file script: auto-installs required Python libraries if missing.
+- GPU-first: 4-bit quantization (bitsandbytes) + LoRA for low VRAM training on a gaming PC.
+- CPU fallback: allowed only with --force_cpu (may OOM for Gemma; not recommended).
+- Handles CSV/JSON/JSONL; can also download dataset from a URL (--dataset_url).
+- Class imbalance aware (weighted cross-entropy).
+- Saves a tiny LoRA adapter usable on very small servers for inference.
 
-Example (quick start):
-    pip install -U "transformers&gt;=4.43" peft bitsandbytes datasets accelerate evaluate scikit-learn
-    python train_gemma_badwords.py \
-        --dataset_path data/badwords.csv \
-        --text_column text --label_column label \
-        --base_model google/gemma-2-2b-it \
-        --output_dir outputs/gemma-badwords-qlora
+Quick usage (no manual installs needed):
+    python train_gemma_badwords.py \\
+      --dataset_path data/badwords.csv \\
+      --text_column text --label_column label \\
+      --base_model google/gemma-2-2b-it \\
+      --output_dir outputs/gemma-badwords-qlora \\
+      --preset low_vram
 
 Notes:
-- Training should be done on your gaming PC (GPU recommended). The final adapter is small and can be served on your tiny server.
-- For best results, prepare a balanced dataset with clear labels: 1 = bad/offensive, 0 = clean.
+- Train on your gaming PC (with NVIDIA GPU). Deploy the small adapter on the tiny server.
+- Use binary labels: 1 = bad/offensive, 0 = clean.
 """
 
 import argparse
 import json
 import os
-from dataclasses import dataclass
-from typing import Dict, Optional, List, Any
+import sys
+import subprocess
+import importlib.util
+import urllib.request
+from typing import Optional, List
+import shutil
+import time
 
+# ---------------------------
+# Bootstrap: ensure dependencies installed
+# ---------------------------
+
+REQUIRED_PKGS = [
+    "numpy",
+    # Transformers/PEFT stack
+    "transformers>=4.43",
+    "peft",
+    "bitsandbytes",
+    "datasets",
+    "accelerate",
+    "evaluate",
+    "scikit-learn",
+    # torch: installing CPU-only by default if missing. For CUDA, user can pre-install.
+    "torch",
+]
+
+def _pip_install(spec: str) -> None:
+    print(f"[setup] Installing: {spec}")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", spec])
+
+def _is_installed(module: str) -> bool:
+    return importlib.util.find_spec(module) is not None
+
+def ensure_dependencies():
+    missing = []
+    # Map import names for some pkgs
+    import_name_map = {
+        "transformers>=4.43": "transformers",
+        "scikit-learn": "sklearn",
+    }
+    for spec in REQUIRED_PKGS:
+        mod_name = import_name_map.get(spec, spec.split("==")[0].split(">=")[0])
+        if not _is_installed(mod_name):
+            missing.append(spec)
+
+    if missing:
+        print("[setup] Missing dependencies detected. Attempting installation...")
+        # Special handling: install torch first to satisfy others (avoid bnb building wheels before torch)
+        torch_specs = [s for s in missing if s.startswith("torch")]
+        other_specs = [s for s in missing if not s.startswith("torch")]
+        for spec in torch_specs + other_specs:
+            try:
+                _pip_install(spec)
+            except subprocess.CalledProcessError as e:
+                print(f"[setup] WARNING: Failed to install {spec}: {e}")
+                # Continue; some environments may still work if the package is optional
+
+    # Final check
+    for spec in REQUIRED_PKGS:
+        mod_name = import_name_map.get(spec, spec.split("==")[0].split(">=")[0])
+        if not _is_installed(mod_name):
+            print(f"[setup] WARNING: {spec} still not importable. The script may fail if this is required.")
+
+ensure_dependencies()
+
+# Now safe to import heavy libraries
 import numpy as np
 import torch
 from datasets import load_dataset, DatasetDict
-from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
+from sklearn.metrics import precision_recall_fscore_support
 import evaluate
-
 from transformers import (
     AutoTokenizer,
     AutoConfig,
@@ -44,7 +107,6 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
-
 from peft import (
     LoraConfig,
     TaskType,
@@ -62,7 +124,6 @@ def _bf16_supported() -> bool:
     major, minor = torch.cuda.get_device_capability()
     return (major, minor) >= (8, 0)  # Ampere+
 
-
 def infer_file_type(path: str) -> str:
     lower = path.lower()
     if lower.endswith(".csv"):
@@ -72,7 +133,6 @@ def infer_file_type(path: str) -> str:
     if lower.endswith(".json"):
         return "json"
     raise ValueError(f"Unsupported dataset file extension for: {path}")
-
 
 def ensure_label_ints(dataset: DatasetDict, label_column: str) -> DatasetDict:
     # Convert labels to ints (0/1) if they come as strings like "0"/"1" or "clean"/"bad"
@@ -102,7 +162,6 @@ def ensure_label_ints(dataset: DatasetDict, label_column: str) -> DatasetDict:
 
     return dataset.map(map_labels)
 
-
 def compute_class_weights(labels: List[int]) -> torch.Tensor:
     # Weighted cross-entropy to mitigate class imbalance
     labels_arr = np.array(labels)
@@ -112,35 +171,16 @@ def compute_class_weights(labels: List[int]) -> torch.Tensor:
     weights = counts.sum() / (counts * n_classes)
     return torch.tensor(weights, dtype=torch.float32)
 
-
-# ---------------------------
-# Data module
-# ---------------------------
-
-def build_dataset(path: str, text_col: str, label_col: str, seed: int, val_size: float) -> DatasetDict:
-    ftype = infer_file_type(path)
-    if ftype == "csv":
-        raw = load_dataset("csv", data_files={"train": path})
-    else:
-        raw = load_dataset("json", data_files={"train": path}, split=None)
-
-    if isinstance(raw, dict):
-        ds = DatasetDict(raw)
-    else:
-        ds = DatasetDict({"train": raw})
-
-    # If no explicit validation, make a split
-    if "validation" not in ds:
-        split = ds["train"].train_test_split(test_size=val_size, seed=seed, stratify_by_column=label_col if label_col in ds["train"].column_names else None)
-        ds = DatasetDict(train=split["train"], validation=split["test"])
-
-    # Ensure required columns exist
-    for col in (text_col, label_col):
-        if col not in ds["train"].column_names:
-            raise ValueError(f"Column '{col}' not found in dataset. Available: {ds['train'].column_names}")
-
-    return ds
-
+def maybe_download_dataset(dataset_path: str, dataset_url: Optional[str]) -> str:
+    if os.path.exists(dataset_path):
+        return dataset_path
+    if dataset_url:
+        os.makedirs(os.path.dirname(dataset_path) or ".", exist_ok=True)
+        print(f"[data] Downloading dataset from {dataset_url} -> {dataset_path}")
+        with urllib.request.urlopen(dataset_url) as r, open(dataset_path, "wb") as f:
+            shutil.copyfileobj(r, f)
+        return dataset_path
+    raise FileNotFoundError(f"Dataset path not found: {dataset_path}. Provide --dataset_url to download.")
 
 # ---------------------------
 # Trainer with weighted loss
@@ -164,14 +204,46 @@ class WeightedTrainer(Trainer):
         loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
 
+# ---------------------------
+# Data module
+# ---------------------------
+
+def build_dataset(path: str, text_col: str, label_col: str, seed: int, val_size: float) -> DatasetDict:
+    ftype = infer_file_type(path)
+    if ftype == "csv":
+        raw = load_dataset("csv", data_files={"train": path})
+    else:
+        raw = load_dataset("json", data_files={"train": path}, split=None)
+
+    if isinstance(raw, dict):
+        ds = DatasetDict(raw)
+    else:
+        ds = DatasetDict({"train": raw})
+
+    # If no explicit validation, make a split
+    if "validation" not in ds:
+        split = ds["train"].train_test_split(
+            test_size=val_size,
+            seed=seed,
+            stratify_by_column=label_col if label_col in ds["train"].column_names else None,
+        )
+        ds = DatasetDict(train=split["train"], validation=split["test"])
+
+    # Ensure required columns exist
+    for col in (text_col, label_col):
+        if col not in ds["train"].column_names:
+            raise ValueError(f"Column '{col}' not found in dataset. Available: {ds['train'].column_names}")
+
+    return ds
 
 # ---------------------------
 # Main
 # ---------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="QLoRA fine-tuning for bad-word classification on Gemma.")
+    parser = argparse.ArgumentParser(description="Self-installing QLoRA trainer for Gemma bad-word classification.")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to CSV/JSON/JSONL with text+label columns.")
+    parser.add_argument("--dataset_url", type=str, default=None, help="Optional URL to download dataset if dataset_path is missing.")
     parser.add_argument("--text_column", type=str, default="text", help="Name of the text column.")
     parser.add_argument("--label_column", type=str, default="label", help="Name of the label column (0/1).")
     parser.add_argument("--base_model", type=str, default="google/gemma-2-2b-it", help="Base Gemma model to fine-tune.")
@@ -196,18 +268,37 @@ def main():
     parser.add_argument("--push_to_hub", action="store_true")
     parser.add_argument("--hub_model_id", type=str, default=None)
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory.")
+    parser.add_argument("--preset", type=str, choices=["base", "low_vram"], default="base", help="Convenience presets for VRAM.")
+    parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
     args = parser.parse_args()
+
+    # Apply presets
+    if args.preset == "low_vram":
+        # Lower memory footprint settings
+        if not args.gradient_accumulation_steps or args.gradient_accumulation_steps < 16:
+            args.gradient_accumulation_steps = 16
+        args.per_device_train_batch_size = 1
+        args.per_device_eval_batch_size = 1
+        args.max_length = min(args.max_length, 128)
+        args.gradient_checkpointing = True
+        # Slightly lower LR can stabilize with high accumulation
+        args.learning_rate = min(args.learning_rate, 2e-4)
+
+    # Dataset presence or download
+    dataset_path = maybe_download_dataset(args.dataset_path, args.dataset_url)
+
+    # Environment checks
+    has_cuda = torch.cuda.is_available()
+    if not has_cuda and not args.force_cpu:
+        raise SystemExit(
+            "No CUDA GPU detected. QLoRA with bitsandbytes requires an NVIDIA GPU. "
+            "If you still want to attempt CPU training (not recommended; may OOM), pass --force_cpu."
+        )
 
     set_seed(args.seed)
 
+    # Compute dtype
     compute_dtype = torch.bfloat16 if _bf16_supported() else torch.float16
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=compute_dtype,
-    )
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
@@ -215,7 +306,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # Dataset
-    ds = build_dataset(args.dataset_path, args.text_column, args.label_column, seed=args.seed, val_size=args.val_size)
+    ds = build_dataset(dataset_path, args.text_column, args.label_column, seed=args.seed, val_size=args.val_size)
     ds = ensure_label_ints(ds, args.label_column)
 
     def tokenize_fn(batch):
@@ -223,26 +314,45 @@ def main():
         toks["labels"] = batch[args.label_column]
         return toks
 
-    ds_tokenized = ds.map(tokenize_fn, batched=True, remove_columns=[c for c in ds["train"].column_names if c not in [args.text_column, args.label_column]])
+    ds_tokenized = ds.map(
+        tokenize_fn,
+        batched=True,
+        remove_columns=[c for c in ds["train"].column_names if c not in [args.text_column, args.label_column]],
+    )
     collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
 
-    # Config and model
+    # Labels/config
     num_labels = int(max(int(max(ds["train"][args.label_column])), int(max(ds["validation"][args.label_column])))) + 1
     config = AutoConfig.from_pretrained(args.base_model, num_labels=num_labels)
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.base_model,
-        config=config,
-        quantization_config=bnb_config,
-        torch_dtype=compute_dtype,
-        device_map="auto",
-    )
+    # Model loading (GPU QLoRA vs CPU)
+    model_kwargs = {"config": config}
+    if has_cuda:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+        model_kwargs.update(
+            dict(
+                quantization_config=bnb_config,
+                torch_dtype=compute_dtype,
+                device_map="auto",
+            )
+        )
+    else:
+        # CPU path (likely OOM for Gemma). No quantization_config.
+        model_kwargs.update(dict(torch_dtype=torch.float32))
 
-    if args.gradient_checkpointing:
+    model = AutoModelForSequenceClassification.from_pretrained(args.base_model, **model_kwargs)
+
+    if args.gradient_checkpointing and has_cuda:
         model.gradient_checkpointing_enable()
 
-    # Prepare for k-bit training and apply LoRA
-    model = prepare_model_for_kbit_training(model)
+    # Prepare for k-bit training and apply LoRA (GPU only)
+    if has_cuda:
+        model = prepare_model_for_kbit_training(model)
 
     # Typical Llama/Gemma target modules
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
@@ -270,7 +380,9 @@ def main():
         preds = np.argmax(logits, axis=-1)
         acc = accuracy.compute(predictions=preds, references=labels)["accuracy"]
         f1_macro = f1.compute(predictions=preds, references=labels, average="macro")["f1"]
-        precision, recall, f1_bin, _ = precision_recall_fscore_support(labels, preds, average="binary", zero_division=0)
+        precision, recall, f1_bin, _ = precision_recall_fscore_support(
+            labels, preds, average="binary", zero_division=0
+        )
         return {
             "accuracy": acc,
             "f1_macro": f1_macro,
@@ -279,8 +391,8 @@ def main():
             "f1_bin": f1_bin,
         }
 
-    # Training args tuned for small VRAM
-    train_args = TrainingArguments(
+    # Training args
+    training_kwargs = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
         learning_rate=args.learning_rate,
@@ -294,8 +406,6 @@ def main():
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
-        bf16=(compute_dtype == torch.bfloat16),
-        fp16=(compute_dtype == torch.float16),
         report_to="none",
         load_best_model_at_end=True,
         metric_for_best_model="f1_bin",
@@ -303,6 +413,15 @@ def main():
         push_to_hub=args.push_to_hub,
         hub_model_id=args.hub_model_id,
     )
+    if has_cuda:
+        training_kwargs.update(
+            dict(
+                bf16=(compute_dtype == torch.bfloat16),
+                fp16=(compute_dtype == torch.float16),
+            )
+        )
+
+    train_args = TrainingArguments(**training_kwargs)
 
     trainer = WeightedTrainer(
         class_weights=class_weights,
@@ -316,7 +435,9 @@ def main():
     )
 
     # Train
+    t0 = time.time()
     trainer.train()
+    t1 = time.time()
 
     # Save adapter and tokenizer only (small)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -332,12 +453,14 @@ def main():
         "text_column": args.text_column,
         "label_column": args.label_column,
         "max_length": args.max_length,
-        "notes": "Load base Gemma in 4-bit and merge with this adapter for bad-word classification.",
+        "notes": "Load base Gemma in 4-bit (GPU) and merge with this adapter for bad-word classification.",
+        "train_seconds": round(t1 - t0, 2),
+        "preset": args.preset,
     }
     with open(os.path.join(args.output_dir, "inference_card.json"), "w", encoding="utf-8") as f:
         json.dump(card, f, indent=2)
 
-    print(f"Training complete. Adapter saved to: {args.output_dir}")
+    print(f"Training complete in {round(t1 - t0, 2)}s. Adapter saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":
