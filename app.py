@@ -71,6 +71,33 @@ DEFAULT_EN_BAD_WORDS: Set[str] = {
     "whore",
 }
 
+# Sinhala common words/particles to exclude (reduce false positives)
+SINHALA_STOPWORDS: Set[str] = {
+    "කොහොමද",
+    "මොකද",
+    "කර",
+    "කරන",
+    "කරන්නේ",
+    "න්න",
+    "කියලා",
+    "මම",
+    "ඔබ",
+    "ඔයා",
+    "අපි",
+    "ඔක්කෝම",
+    "තම",
+    "තමා",
+    "ඒ",
+    "මේ",
+    "එක",
+    "හා",
+    "ද",
+    "නමුත්",
+    "නෑ",
+    "නැහැ",
+    "ඉතින්",
+}
+
 # Aho-corasick automatons (optional)
 AC_AUTOMATON_EN = None
 AC_AUTOMATON_SI = None
@@ -286,7 +313,8 @@ def load_si_bad_words_mrmrvl() -> Tuple[Set[str], Set[str]]:
 # SOLD loader with fallback disabled if datasets isn't available
 
 def load_si_bad_words_sold() -> Set[str]:
-    if os.getenv("USE_SOLD", "1").lower() not in {"1", "true", "yes"}:
+    # Default to disabled to avoid noisy lexicon unless explicitly enabled
+    if os.getenv("USE_SOLD", "0").lower() not in {"1", "true", "yes"}:
         logger.info("USE_SOLD disabled; skipping SOLD load.")
         return set()
 
@@ -468,18 +496,30 @@ def init_lexicons() -> None:
     topn = int(os.getenv("SEMISOLD_TOP_TOKENS", "1000"))
     si_semisold = _load_semisold_tokens(threshold=thr, top_tokens=topn)
 
+    # Build Sinhala set and apply stopword filter
     BAD_WORDS_SI = set()
     for w in si_unicode_mrmrvl.union(si_sold).union(si_semisold):
-        BAD_WORDS_SI.add(unicodedata.normalize("NFKC", w))
+        w_norm = unicodedata.normalize("NFKC", w)
+        if len(w_norm) < 3:
+            continue
+        if w_norm in SINHALA_STOPWORDS:
+            continue
+        BAD_WORDS_SI.add(w_norm)
 
+    # Singlish set (lowercased)
     BAD_WORDS_SI_SINGLISH = set()
     for w in si_singlish_mrmrvl:
-        BAD_WORDS_SI_SINGLISH.add(w.lower())
+        w_l = w.lower().strip()
+        if len(w_l) < 2:
+            continue
+        BAD_WORDS_SI_SINGLISH.add(w_l)
 
+    # Custom overrides from env
     en_c, si_c, si_sing_c = load_custom_words_from_env()
     BAD_WORDS_EN.update(en_c)
-    BAD_WORDS_SI.update(si_c)
-    BAD_WORDS_SI_SINGLISH.update(si_sing_c)
+    # Apply stopword filter to env Sinhala too
+    BAD_WORDS_SI.update({unicodedata.normalize("NFKC", w) for w in si_c if len(w) >= 3 and w not in SINHALA_STOPWORDS})
+    BAD_WORDS_SI_SINGLISH.update({w.lower() for w in si_sing_c if len(w) >= 2})
 
     # build automatons if available
     if HAS_AHO:
@@ -498,7 +538,7 @@ def init_lexicons() -> None:
         len(BAD_WORDS_EN),
         len(BAD_WORDS_SI),
         len(BAD_WORDS_SI_SINGLISH),
-        os.getenv("USE_SOLD", "1"),
+        os.getenv("USE_SOLD", "0"),
         os.getenv("USE_SEMISOLD", "0"),
         HAS_AHO,
         HAS_RAPIDFUZZ,
