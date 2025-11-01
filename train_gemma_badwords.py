@@ -1014,7 +1014,7 @@ def main():
     # Register evaluation delay callback if requested
     if (args.eval_start_step and args.eval_start_step > 0) or (args.eval_start_epoch and args.eval_start_epoch > 0.0):
         trainer.add_callback(DelayedEvalCallback(start_step=args.eval_start_step, start_epoch=args.eval_start_epoch))
-        logging.info("[eval] Evaluation will be skipped until step >= %s and epoch >= %s", args.eval_start_step, args.eval_start_ep_codeocnewh</)
+        logging.info("[eval] Evaluation will be skipped until step >= %s and epoch >= %s", args.eval_start_step, args.eval_start_epoch)
 
 
     # Train
