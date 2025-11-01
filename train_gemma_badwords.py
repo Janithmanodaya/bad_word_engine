@@ -164,7 +164,13 @@ try:
 except Exception:
     pass
 try:
-    torch.backends.cuda.matmul.allow_tf32 = True  # Ampere+
+    torch.backends.cuda.matmul.allow_tf32 = True  # Ampere+ TF32 fast matmul
+except Exception:
+    pass
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
 
 # ---------------------------
 # Wordlist utilities
