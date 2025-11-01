@@ -109,6 +109,13 @@ def load_si_bad_words_mrmrvl() -> Tuple[Set[str], Set[str]]:
 
 
 def load_si_bad_words_sold() -> Set[str]:
+    """
+    Load token-level offensive Sinhala words from SOLD rationales.
+    Controlled by USE_SOLD env var (default: enabled).
+    """
+    if os.getenv("USE_SOLD", "1").lower() not in {"1", "true", "yes"}:
+        return set()
+
     words: Set[str] = set()
     try:
         from datasets import load_dataset  # type: ignore
@@ -173,15 +180,71 @@ def load_custom_words_from_env() -> Tuple[Set[str], Set[str], Set[str]]:
     return en, si, si_sing
 
 
+def _load_semisold_tokens(threshold: float = 0.8, top_tokens: int = 1000) -> Set[str]:
+    """
+    Heuristically derive additional Sinhala offensive tokens from SemiSOLD by:
+    - averaging available score columns per row
+    - selecting rows with score >= threshold
+    - extracting Sinhala tokens and taking most frequent top_tokens
+    Controlled by USE_SEMISOLD env var (default: disabled).
+    """
+    if os.getenv("USE_SEMISOLD", "0").lower() not in {"1", "true", "yes"}:
+        return set()
+
+    try:
+        from datasets import load_dataset  # type: ignore
+    except Exception:
+        return set()
+
+    try:
+        ds = load_dataset("sinhala-nlp/SemiSOLD", split="train")
+    except Exception:
+        return set()
+
+    # Identify numeric score columns dynamically (values typically in [0,1])
+    score_cols = []
+    sample = ds[0] if len(ds) else {}
+    for k, v in sample.items():
+        if isinstance(v, (int, float)):
+            score_cols.append(k)
+    if not score_cols:
+        # fallback to known names
+        score_cols = ["xlmr", "xlmt", "mbert", "sinbert", "lstm_ft", "cnn_ft", "lstm_cbow", "cnn_cbow", "lstm_sl", "cnn_sl", "svm"]
+
+    # Collect tokens from high-score rows
+    freq = {}
+    for row in ds:
+        scores = [float(row.get(c, 0.0)) for c in score_cols if isinstance(row.get(c, None), (int, float))]
+        if not scores:
+            continue
+        mean_score = sum(scores) / len(scores)
+        if mean_score < threshold:
+            continue
+        text = normalize_text(str(row.get("text", "")))
+        # Extract Sinhala tokens only
+        _, si_tokens = tokenize(text)
+        for tok in si_tokens:
+            tok_n = unicodedata.normalize("NFKC", tok)
+            freq[tok_n] = freq.get(tok_n, 0) + 1
+
+    # Take top tokens
+    sorted_toks = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:top_tokens]
+    return {t for t, _ in sorted_toks}
+
+
 def init_lexicons() -> None:
     global BAD_WORDS_EN, BAD_WORDS_SI, BAD_WORDS_SI_SINGLISH
     BAD_WORDS_EN = load_en_bad_words()
 
     si_unicode_mrmrvl, si_singlish_mrmrvl = load_si_bad_words_mrmrvl()
     si_sold = load_si_bad_words_sold()
+    # Optional SemiSOLD harvesting
+    thr = float(os.getenv("SEMISOLD_THRESHOLD", "0.8"))
+    topn = int(os.getenv("SEMISOLD_TOP_TOKENS", "1000"))
+    si_semisold = _load_semisold_tokens(threshold=thr, top_tokens=topn)
 
     BAD_WORDS_SI = set()
-    for w in si_unicode_mrmrvl.union(si_sold):
+    for w in si_unicode_mrmrvl.union(si_sold).union(si_semisold):
         BAD_WORDS_SI.add(unicodedata.normalize("NFKC", w))
 
     BAD_WORDS_SI_SINGLISH = set()
@@ -262,7 +325,8 @@ def health():
         "en_words": len(BAD_WORDS_EN),
         "si_words": len(BAD_WORDS_SI),
         "si_singlish_words": len(BAD_WORDS_SI_SINGLISH),
-    }
+        "use_sold": os.getenv("USE_SOLD", "1"),
+        "    }
 
 
 @app.post("/check")
