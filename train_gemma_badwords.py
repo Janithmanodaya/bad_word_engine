@@ -601,6 +601,8 @@ def main():
         if not clean_words:
             logging.warning("[wordlist] No clean words downloaded; training may not be meaningful.")
         build_wordlist_dataset_csv(dataset_path, bad_words, clean_words, augment_context=args.augment_context)
+        # Summarize download results for clear verification in logs
+        _summarize_downloads()
 
     # Dataset presence or download otherwise
     dataset_path = maybe_download_dataset(dataset_path, args.dataset_url)
