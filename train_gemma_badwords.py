@@ -921,6 +921,25 @@ def main():
     )
 
     # Train
+    logging.info("=" * 70)
+    logging.info("DATASET SUMMARY BEFORE TRAINING")
+    if args.use_sold:
+        logging.info("[SOLD] Source: HuggingFace hub 'sinhala-nlp/SOLD' (downloaded via datasets)")
+    else:
+        logging.info("[DATA] Source: local file '%s'%s",
+                     dataset_path,
+                     " (downloaded from URL)" if args.dataset_url else "")
+    logging.info("[DATA] Train size: %d, Validation size: %d", len(ds["train"]), len(ds["validation"]))
+    try:
+        import collections as _collections
+        _cnt_train = _collections.Counter(ds["train"][args.label_column])
+        _cnt_val = _collections.Counter(ds["validation"][args.label_column])
+        logging.info("[DATA] Label distribution (train): %s", dict(_cnt_train))
+        logging.info("[DATA] Label distribution (validation): %s", dict(_cnt_val))
+    except Exception as _e:
+        logging.warning("[DATA] Failed to compute label distribution: %s", _e)
+    logging.info("=" * 70)
+
     logging.info("Beginning training...")
     t0 = time.time()
     train_result = trainer.train()
