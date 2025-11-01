@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+"""
+Self-bootstrapping QLoRA trainer for bad-word classification on Google Gemma.
+
+Key features:
+- One-file script: auto-installs required Python libraries if missing.
+- GPU-first: 4-bit quantization (bitsandbytes) + LoRA for low VRAM training on a gaming PC.
+- CPU fallback: allowed only with --force_cpu (may OOM for Gemma; not recommended).
+- Handles CSV/JSON/JSONL; can also download dataset from a URL (--dataset_url).
+- Can auto-build a dataset from public bad-word lists (--auto_wordlists).
+- Class imbalance aware (weighted cross-entropy).
+- Saves a tiny LoRA adapter usable on very small servers for inference.
+- Detailed logging to console and file for progress tracking.
+
+Quick usage (no manual installs needed):
+    python train_gemma_badwords.py \\
+      --dataset_path data/badwords.csv \\
+      --text_column text --label_column label \\
+      --base_model google/gemma-2-2b-it \\
+      --output_dir outputs/gemma-badwords-qlora \\
+      --preset low_vram
+
+Notes:
+- Train on your gaming PC (with NVIDIA GPU). Deploy the small adapter on the tiny server.
+- Use binary labels: 1 = bad/offensive, 0 = clean.
+"""
+
+import argparse
+import json
+import os
+import sys
+import subprocess
+import importlib.util
+import urllib.request
+from typing import Optional, List
+import shutil
+import time
+import logging
+
+# ---------------------------
+# Colab detection
+# ---------------------------
+
+def in_colab() -> bool:
+    try:
+        import google.colab  # type: ignore
+        return True
+    except Exception:
+        return False
+
+# ---------------------------
+# Bootstrap: ensure dependencies installed
+# ---------------------------
+
+REQUIRED_PKGS = [
+    "numpy",
+    # Transformers/PEFT stack
+    "transformers>=4.43",
+    "peft",
+    "bitsandbytes",
+    "datasets",
+    "accelerate",
+    "evaluate",
+    "scikit-learn",
+]
+
+def _pip_install(args: list) -> None:
+    logging.getLogger("setup").info(f"Installing: {' '.join(args)}")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade"] + args)
+
+def _is_installed(module: str) -> bool:
+    return importlib.util.find_spec(module) is not None
+
+def _install_torch_best_effort():
+    # If torch is installed, nothing to do
+    if _is_installed("torch"):
+        return
+    try:
+        # Prefer CUDA wheel if NVIDIA driver present
+        has_nvidia = shutil.which("nvidia-smi") is not None
+        if has_nvidia:
+            # Default to CUDA 12.1 wheels which work on recent GPUs
+            _pip_install(["torch", "--index-url", "https://download.pytorch.org/whl/cu121"])
+        else:
+            _pip_install(["torch"])
+    except subprocess.CalledProcessError as e:
+        print(f"[setup] WARNING: torch install failed: {e}. Trying CPU wheel.")
+        try:
+            _pip_install(["torch"])
+        except Exception as e2:
+            print(f"[setup] WARNING: torch CPU install also failed: {e2}. Continuing; training may not work.")
+
+def ensure_dependencies():
+    # Prefer not to disturb Colab's preinstalled CUDA/torch stack
+    if not in_colab():
+        _install_torch_best_effort()
+
+    missing = []
+    # Map import names for some pkgs
+    import_name_map = {
+        "transformers>=4.43": "transformers",
+        "scikit-learn": "sklearn",
+    }
+    for spec in REQUIRED_PKGS:
+        mod_name = import_name_map.get(spec, spec.split("==")[0].split(">=")[0])
+        if not _is_installed(mod_name):
+            missing.append(spec)
+
+    if missing:
+        print("[setup] Installing missing dependencies...")
+        for spec in missing:
+            try:
+                _pip_install([spec])
+            except subprocess.CalledProcessError as e:
+                print(f"[setup] WARNING: Failed to install {spec}: {e}")
+
+    # Optional: install git-lfs on Colab to accelerate model downloads
+    if in_colab():
+        try:
+            if shutil.which("git-lfs") is None:
+                subprocess.check_call(["apt-get", "update", "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.check_call(["apt-get", "install", "-y", "git-lfs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[setup] WARNING: git-lfs install failed or unnecessary: {e}")
+
+    # Final check logging
+    for spec in REQUIRED_PKGS + ["torch"]:
+        name = spec.split("==")[0].split(">=")[0]
+        print(f"[setup] {name}: {'OK' if _is_installed(name) else 'MISSING'}")
+
+ensure_dependencies()
+
+# Now safe to import heavy libraries
+import numpy as np
+import torch
+from datasets import load_dataset, DatasetDict
+try:
+    from sklearn.metrics import precision_recall_fscore_support  # type: ignore
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
+import evaluate
+from transformers import (
+    AutoTokenizer,
+    AutoConfig,
+    AutoModelForSequenceClassification,
+    BitsAndBytesConfig,
+    DataCollatorWithPadding,
+    Trainer,
+    TrainingArguments,
+    set_seed,
+)
+from transformers.utils import logging as hf_logging
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+)
+from huggingface_hub import login as hf_login
+from huggingface_hub.errors import GatedRepoError
+
+# ---------------------------
+# Wordlist utilities
+# ---------------------------
+
+DEFAULT_BADWORDS_REPO = "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master"
+DEFAULT_CLEANWORDS_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt"
+
+def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO) -> List[str]:
+    bad = []
+    alt_sources = {
+        # Try alternative sources per language if LDNOOBW lacks it
+        "si": [
+            # Add more known sources here if available publicly
+            # Example mirrors or community lists (may or may not exist at runtime)
+            "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master/si",  # original attempt
+            "https://raw.githubusercontent.com/zoomination/multilingual-profanity/main/lists/si.txt",
+            "https://raw.githubusercontent.com/zoomination/multilingual-profanity/master/lists/si.txt",
+        ],
+        "en": [
+            f"{repo_base}/en",
+        ],
+    }
+    for lang in langs:
+        tried = False
+        # Primary URL pattern
+        primary_url = f"{repo_base}/{lang.strip()}"
+        for url in [primary_url] + alt_sources.get(lang.strip(), []):
+            if tried and url == primary_url:
+                continue
+            tried = True
+            try:
+                logging.info(f"[wordlist] Downloading bad words for '{lang}' from {url}")
+                with urllib.request.urlopen(url) as r:
+                    for line in r.read().decode("utf-8", errors="ignore").splitlines():
+                        w = line.strip()
+                        if not w or w.startswith("#"):
+                            continue
+                        bad.append(w)
+                break  # success for this lang
+            except Exception as e:
+                logging.warning(f"[wordlist] Failed to download {url}: {e}")
+                continue
+    # Deduplicate, keep order
+    seen = set()
+    uniq = []
+    for w in bad:
+        wl = w.lower()
+        if wl not in seen:
+            seen.add(wl)
+            uniq.append(wl)
+    logging.info(f"[wordlist] Total bad words collected: {len(uniq)}")
+    return uniq
+
+def download_clean_words(url: str = DEFAULT_CLEANWORDS_URL, limit: int = 10000) -> List[str]:
+    clean = []
+    try:
+        logging.info(f"[wordlist] Downloading clean words from {url}")
+        with urllib.request.urlopen(url) as r:
+            for i, line in enumerate(r.read().decode("utf-8", errors="ignore").splitlines()):
+                if not line:
+                    continue
+                clean.append(line.strip().lower())
+                if limit and len(clean) >= limit:
+                    break
+    except Exception as e:
+        logging.warning(f"[wordlist] Failed to download clean words: {e}")
+    logging.info(f"[wordlist] Total clean words collected: {len(clean)}")
+    return clean
+
+def build_wordlist_dataset_csv(out_path: str, bad_words: List[str], clean_words: List[str], augment_context: bool = True) -> None:
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    import csv
+    logging.info(f"[wordlist] Building dataset CSV at {out_path}")
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["text", "label"])
+        # Bad words = 1
+        for w in bad_words:
+            if augment_context:
+                # Simple contexts to help model generalize beyond single-token inputs
+                examples = [w, f"You are {w}.", f"That was {w}!", f"{w} behavior."]
+                for t in examples:
+                    writer.writerow([t, 1])
+            else:
+                writer.writerow([w, 1])
+        # Clean words = 0
+        for w in clean_words:
+            if augment_context:
+                examples = [w, f"This is {w}.", f"A very {w} idea.", f"{w} example."]
+                for t in examples:
+                    writer.writerow([t, 0])
+            else:
+                writer.writerow([w, 0])
+    logging.info(f"[wordlist] Wrote dataset rows: bad≈{len(bad_words)}xN, clean≈{len(clean_words)}xN")
+
+# ---------------------------
+# Utilities
+# ---------------------------
+
+def _bf16_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return (major, minor) >= (8, 0)  # Ampere+
+
+def infer_file_type(path: str) -> str:
+    lower = path.lower()
+    if lower.endswith(".csv"):
+        return "csv"
+    if lower.endswith(".jsonl") or lower.endswith(".jsonl.gz"):
+        return "json"
+    if lower.endswith(".json"):
+        return "json"
+    raise ValueError(f"Unsupported dataset file extension for: {path}")
+
+def ensure_label_ints(dataset: DatasetDict, label_column: str) -> DatasetDict:
+    # Convert labels to ints (0/1) if they come as strings like "0"/"1" or "clean"/"bad"
+    unique = set(dataset["train"][label_column])
+    mapping = {}
+    if all(isinstance(x, (int, np.integer)) for x in unique):
+        return dataset  # already ints
+
+    # Try common mappings
+    lowered = {str(x).lower() for x in unique}
+    if lowered <= {"0", "1"}:
+        mapping = {"0": 0, "1": 1}
+    elif lowered <= {"false", "true"}:
+        mapping = {"false": 0, "true": 1}
+    elif lowered <= {"clean", "bad"}:
+        mapping = {"clean": 0, "bad": 1}
+    elif lowered <= {"safe", "toxic"}:
+        mapping = {"safe": 0, "toxic": 1}
+    else:
+        # Build alphabetical mapping deterministically
+        mapping = {val: i for i, val in enumerate(sorted(unique))}
+
+    def map_labels(example):
+        v = example[label_column]
+        example[label_column] = mapping[str(v).lower()] if str(v).lower() in mapping else mapping.get(v, int(v))
+        return example
+
+    return dataset.map(map_labels)
+
+def compute_class_weights(labels: List[int]) -> torch.Tensor:
+    # Weighted cross-entropy to mitigate class imbalance
+    labels_arr = np.array(labels)
+    n_classes = int(labels_arr.max()) + 1
+    counts = np.bincount(labels_arr, minlength=n_classes).astype(np.float32)
+    counts[counts == 0] = 1.0
+    weights = counts.sum() / (counts * n_classes)
+    return torch.tensor(weights, dtype=torch.float32)
+
+def maybe_download_dataset(dataset_path: str, dataset_url: Optional[str]) -> str:
+    if os.path.exists(dataset_path):
+        return dataset_path
+    if dataset_url:
+        os.makedirs(os.path.dirname(dataset_path) or ".", exist_ok=True)
+        logging.info(f"[data] Downloading dataset from {dataset_url} -> {dataset_path}")
+        with urllib.request.urlopen(dataset_url) as r, open(dataset_path, "wb") as f:
+            shutil.copyfileobj(r, f)
+        return dataset_path
+    raise FileNotFoundError(f"Dataset path not found: {dataset_path}. Provide --dataset_url to download.")
+
+# ---------------------------
+# Trainer with weighted loss
+# ---------------------------
+
+class WeightedTrainer(Trainer):
+    def __init__(self, class_weights: Optional[torch.Tensor] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.class_weights = class_weights
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        if self.class_weights is not None:
+            device = logits.device
+            weights = self.class_weights.to(device)
+            loss_fct = torch.nn.CrossEntropyLoss(weight=weights)
+        else:
+            loss_fct = torch.nn.CrossEntropyLoss()
+        loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+        return (loss, outputs) if return_outputs else loss
+
+# ---------------------------
+# Data module
+# ---------------------------
+
+def build_dataset(path: str, text_col: str, label_col: str, seed: int, val_size: float) -> DatasetDict:
+    ftype = infer_file_type(path)
+    if ftype == "csv":
+        raw = load_dataset("csv", data_files={"train": path})
+    else:
+        raw = load_dataset("json", data_files={"train": path}, split=None)
+
+    if isinstance(raw, dict):
+        ds = DatasetDict(raw)
+    else:
+        ds = DatasetDict({"train": raw})
+
+    # If no explicit validation, make a split
+    if "validation" not in ds:
+        split = ds["train"].train_test_split(
+            test_size=val_size,
+            seed=seed,
+            stratify_by_column=label_col if label_col in ds["train"].column_names else None,
+        )
+        ds = DatasetDict(train=split["train"], validation=split["test"])
+
+    # Ensure required columns exist
+    for col in (text_col, label_col):
+        if col not in ds["train"].column_names:
+            raise ValueError(f"Column '{col}' not found in dataset. Available: {ds['train'].column_names}")
+
+    return ds
+
+# ---------------------------
+# Main
+# ---------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Self-installing QLoRA trainer for Gemma bad-word classification.")
+    parser.add_argument("--dataset_path", type=str, default="data/auto_badwords_en_si.csv", help="Path to CSV/JSON/JSONL with text+label columns.")
+    parser.add_argument("--dataset_url", type=str, default=None, help="Optional URL to download dataset if dataset_path is missing.")
+    # Auto wordlist options
+    parser.add_argument("--auto_wordlists", action="store_true", default=True, help="Build dataset automatically from public word lists.")
+    parser.add_argument("--bad_words_langs", type=str, default="en,si", help="Comma-separated languages for bad-word lists (e.g., 'en,si').")
+    parser.add_argument("--bad_words_repo_url", type=str, default=DEFAULT_BADWORDS_REPO, help="Base repo URL for bad-word lists.")
+    parser.add_argument("--clean_words_url", type=str, default=DEFAULT_CLEANWORDS_URL, help="URL for clean words list.")
+    parser.add_argument("--wordlist_clean_limit", type=int, default=10000, help="Max number of clean words to use.")
+    parser.add_argument("--augment_context", action="store_true", default=True, help="Wrap words into short sentences for better generalization.")
+    parser.add_argument("--regenerate_wordlist", action="store_true", help="Rebuild dataset CSV from wordlists even if file exists.")
+    # Training/data params
+    parser.add_argument("--text_column", type=str, default="text", help="Name of the text column.")
+    parser.add_argument("--label_column", type=str, default="label", help="Name of the label column (0/1).")
+    parser.add_argument("--base_model", type=str, default="google/gemma-2-2b-it", help="Base Gemma model to fine-tune.")
+    parser.add_argument("--output_dir", type=str, default="outputs/gemma-badwords-qlora", help="Where to save LoRA adapter and tokenizer.")
+    parser.add_argument("--max_length", type=int, default=128)
+    parser.add_argument("--num_train_epochs", type=int, default=2)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=1)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=16)
+    parser.add_argument("--warmup_ratio", type=float, default=0.05)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--val_size", type=float, default=0.1)
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--save_total_limit", type=int, default=3)
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--eval_steps", type=int, default=50)
+    parser.add_argument("--save_steps", type=int, default=200)
+    parser.add_argument("--push_to_hub", action="store_true")
+    parser.add_argument("--hub_model_id", type=str, default=None)
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory.")
+    parser.add_argument("--preset", type=str, choices=["base", "low_vram"], default="low_vram", help="Convenience presets for VRAM.")
+    parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
+    # Auth and fallback
+    parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"), help="Hugging Face token for gated models.")
+    parser.add_argument("--fallback_model", type=str, default="Qwen/Qwen2-1.5B-Instruct", help="Fallback open model if base model is gated and no token.")
+    args = parser.parse_args()
+
+    # Prepare output/logging
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Colab-specific cache optimization
+    if in_colab():
+        os.environ.setdefault("HF_HOME", "/content/cache/hf")
+        os.environ.setdefault("TRANSFORMERS_CACHE", "/content/cache/transformers")
+        os.environ.setdefault("DATASETS_CACHE", "/content/cache/datasets")
+        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        os.makedirs(os.environ["HF_HOME"], exist_ok=True)
+        os.makedirs(os.environ["TRANSFORMERS_CACHE"], exist_ok=True)
+        os.makedirs(os.environ["DATASETS_CACHE"], exist_ok=True)
+
+    log_path = os.path.join(args.output_dir, "train.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(log_path, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
+    )
+    # HF transformers logging
+    hf_logging.set_verbosity_info()
+    hf_logging.enable_default_handler()
+    hf_logging.enable_explicit_format()
+    logging.info("Starting Gemma bad-words training")
+    logging.info(f"Args: {vars(args)}")
+
+    # Apply presets
+    if args.preset == "low_vram" or in_colab():
+        # Lower memory footprint settings
+        if not args.gradient_accumulation_steps or args.gradient_accumulation_steps < 16:
+            args.gradient_accumulation_steps = 16
+        args.per_device_train_batch_size = 1
+        args.per_device_eval_batch_size = 1
+        args.max_length = min(args.max_length, 128)
+        args.gradient_checkpointing = True
+        # Logging/eval cadence better for Colab
+        args.logging_steps = min(args.logging_steps, 5)
+        args.eval_steps = max(args.eval_steps, 100)
+        args.save_steps = max(args.save_steps, 1000)
+        # Slightly lower LR can stabilize with high accumulation
+        args.learning_rate = min(args.learning_rate, 2e-4)
+
+    # Build dataset from wordlists if requested
+    dataset_path = args.dataset_path
+    if args.auto_wordlists and (args.regenerate_wordlist or not os.path.exists(dataset_path)):
+        langs = [s.strip() for s in args.bad_words_langs.split(",") if s.strip()]
+        bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url)
+        clean_words = download_clean_words(url=args.clean_words_url, limit=args.wordlist_clean_limit)
+        if not bad_words:
+            logging.warning("[wordlist] No bad words downloaded; training may not be meaningful.")
+        if not clean_words:
+            logging.warning("[wordlist] No clean words downloaded; training may not be meaningful.")
+        build_wordlist_dataset_csv(dataset_path, bad_words, clean_words, augment_context=args.augment_context)
+
+    # Dataset presence or download otherwise
+    dataset_path = maybe_download_dataset(dataset_path, args.dataset_url)
+
+    # Environment checks
+    has_cuda = torch.cuda.is_available()
+    logging.info(f"PyTorch version: {torch.__version__}")
+    logging.info(f"CUDA available: {has_cuda}")
+    if has_cuda:
+        try:
+            logging.info(f"CUDA device count: {torch.cuda.device_count()}")
+            logging.info(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        except Exception:
+            pass
+    if not has_cuda and not args.force_cpu:
+        raise SystemExit(
+            "No CUDA GPU detected. QLoRA with bitsandbytes requires an NVIDIA GPU. "
+            "If you still want to attempt CPU training (not recommended; may OOM), pass --force_cpu."
+        )
+
+    set_seed(args.seed)
+
+    # Compute dtype
+    compute_dtype = torch.bfloat16 if _bf16_supported() else torch.float16
+
+    # Optional HF login for gated models
+    if args.hf_token:
+        try:
+            hf_login(token=args.hf_token)
+            logging.info("Hugging Face login successful via token.")
+        except Exception as e:
+            logging.warning(f"HF login failed: {e}")
+
+    # Tokenizer with gated fallback
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
+        active_model_id = args.base_model
+    except GatedRepoError as ge:
+        logging.warning(f"Base model gated and not accessible: {ge}. Falling back to {args.fallback_model}")
+        tokenizer = AutoTokenizer.from_pretrained(args.fallback_model, use_fast=True)
+        active_model_id = args.fallback_model
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_t_codeoknewe</n
+en
+
+    # Dataset
+    ds = build_dataset(dataset_path, args.text_column, args.label_column, seed=args.seed, val_size=args.val_size)
+    ds = ensure_label_ints(ds, args.label_column)
+    # Log dataset stats
+    try:
+        import collections
+        cnt_train = collections.Counter(ds["train"][args.label_column])
+        cnt_val = collections.Counter(ds["validation"][args.label_column])
+        logging.info(f"Dataset sizes: train={len(ds['train'])}, validation={len(ds['validation'])}")
+        logging.info(f"Label distribution (train): {dict(cnt_train)}")
+        logging.info(f"Label distribution (validation): {dict(cnt_val)}")
+    except Exception as e:
+        logging.warning(f"Failed to log dataset stats: {e}")
+
+    def tokenize_fn(batch):
+        toks = tokenizer(batch[args.text_column], max_length=args.max_length, truncation=True)
+        toks["labels"] = batch[args.label_column]
+        return toks
+
+    ds_tokenized = ds.map(
+        tokenize_fn,
+        batched=True,
+        remove_columns=[c for c in ds["train"].column_names if c not in [args.text_column, args.label_column]],
+    )
+    collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
+
+    # Labels/config
+    num_labels = int(max(int(max(ds["train"][args.label_column])), int(max(ds["validation"][args.label_column])))) + 1
+    config = AutoConfig.from_pretrained(active_model_id, num_labels=num_labels)
+
+    # Model loading (GPU QLoRA vs CPU)
+    model_kwargs = {"config": config}
+    if has_cuda:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+        model_kwargs.update(
+            dict(
+                quantization_config=bnb_config,
+                torch_dtype=compute_dtype,
+                device_map="auto",
+            )
+        )
+    else:
+        # CPU path (likely OOM for LLMs). No quantization_config.
+        model_kwargs.update(dict(torch_dtype=torch.float32))
+
+    logging.info(f"Loading base model: {active_model_id}")
+    try:
+        model = AutoModelForSequenceClassification.from_pretrained(active_model_id, **model_kwargs)
+    except GatedRepoError as ge:
+        if active_model_id != args.fallback_model:
+            logging.warning(f"Model gated and not accessible: {ge}. Falling back to {args.fallback_model}")
+            active_model_id = args.fallback_model
+            config = AutoConfig.from_pretrained(active_model_id, num_labels=num_labels)
+            model_kwargs["config"] = config
+            model = AutoModelForSequenceClassification.from_pretrained(active_model_id, **model_kwargs)
+        else:
+            raise
+    logging.info(f"Model loaded. Dtype: {getattr(model, 'dtype', 'mixed')}, gradient_checkpointing={args.gradient_checkpointing}")
+
+    if args.gradient_checkpointing and has_cuda:
+        model.gradient_checkpointing_enable()
+
+    # Prepare for k-bit training and apply LoRA (GPU only)
+    if has_cuda:
+        model = prepare_model_for_kbit_training(model)
+
+    # Typical Llama/Gemma target modules
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+    lora_cfg = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+        task_type=TaskType.SEQ_CLS,
+    )
+    logging.info(f"LoRA config: r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, targets={target_modules}")
+
+    model = get_peft_model(model, lora_cfg)
+
+    # Class weights from training labels
+    class_weights = compute_class_weights(list(ds["train"][args.label_column]))
+
+    # Metrics
+    accuracy = evaluate.load("accuracy")
+    f1_metric = evaluate.load("f1")
+    precision_metric = evaluate.load("precision")
+    recall_metric = evaluate.load("recall")
+
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        preds = np.argmax(logits, axis=-1)
+        acc = accuracy.compute(predictions=preds, references=labels)["accuracy"]
+        f1_macro = f1_metric.compute(predictions=preds, references=labels, average="macro")["f1"]
+        if SKLEARN_AVAILABLE:
+            from sklearn.metrics import precision_recall_fscore_support  # local import
+            precision, recall, f1_bin, _ = precision_recall_fscore_support(
+                labels, preds, average="binary", zero_division=0
+            )
+        else:
+            precision = precision_metric.compute(predictions=preds, references=labels, average="binary")["precision"]
+            recall = recall_metric.compute(predictions=preds, references=labels, average="binary")["recall"]
+            f1_bin = f1_metric.compute(predictions=preds, references=labels, average="binary")["f1"]
+        return {
+            "accuracy": acc,
+            "f1_macro": f1_macro,
+            "precision_bin": precision,
+            "recall_bin": recall,
+            "f1_bin": f1_bin,
+        }
+
+    # Training args
+    training_kwargs = dict(
+        output_dir=args.output_dir,
+        num_train_epochs=args.num_train_epochs,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        warmup_ratio=args.warmup_ratio,
+        logging_steps=args.logging_steps,
+        evaluation_strategy="steps",
+        eval_steps=args.eval_steps,
+        save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
+        report_to="none",
+        load_best_model_at_end=True,
+        metric_for_best_model="f1_bin",
+        greater_is_better=True,
+        push_to_hub=args.push_to_hub,
+        hub_model_id=args.hub_model_id,
+    )
+    if has_cuda:
+        training_kwargs.update(
+            dict(
+                bf16=(compute_dtype == torch.bfloat16),
+                fp16=(compute_dtype == torch.float16),
+            )
+        )
+
+    train_args = TrainingArguments(**training_kwargs)
+
+    trainer = WeightedTrainer(
+        class_weights=class_weights,
+        model=model,
+        tokenizer=tokenizer,
+        args=train_args,
+        train_dataset=ds_tokenized["train"],
+        eval_dataset=ds_tokenized["validation"],
+        data_collator=collator,
+        compute_metrics=compute_metrics,
+    )
+
+    # Train
+    logging.info("Beginning training...")
+    t0 = time.time()
+    train_result = trainer.train()
+    t1 = time.time()
+    logging.info(f"Training finished. Seconds: {round(t1 - t0, 2)}")
+    try:
+        metrics = train_result.metrics if hasattr(train_result, "metrics") else {}
+        logging.info(f"Train metrics: {metrics}")
+    except Exception:
+        pass
+
+    # Save adapter and tokenizer only (small)
+    os.makedirs(args.output_dir, exist_ok=True)
+    logging.info("Saving adapter and tokenizer...")
+    trainer.model.save_pretrained(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+
+    # Export minimal inference card
+    card = {
+        "base_model": active_model_id,
+        "adapter_path": args.output_dir,
+        "task": "sequence-classification",
+        "labels": list(range(num_labels)),
+        "text_column": args.text_column,
+        "label_column": args.label_column,
+        "max_length": args.max_length,
+        "notes": "Load base model in 4-bit (GPU) and merge with this adapter for bad-word classification.",
+        "train_seconds": round(t1 - t0, 2),
+        "preset": args.preset,
+    }
+    with open(os.path.join(args.output_dir, "inference_card.json"), "w", encoding="utf-8") as f:
+        json.dump(card, f, indent=2)
+
+    print(f"Training complete in {round(t1 - t0, 2)}s. Adapter saved to: {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()
