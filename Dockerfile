@@ -14,8 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy application code
+# Copy application code and model artifacts
 COPY app.py /app/app.py
+COPY model /app/model
 
 # Default server binding; override via SERVER_URL env var
 ENV SERVER_URL=0.0.0.0:8000
