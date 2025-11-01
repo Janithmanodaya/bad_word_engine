@@ -168,40 +168,72 @@ DEFAULT_BADWORDS_REPO = "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty
 DEFAULT_CLEANWORDS_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt"
 
 def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO) -> List[str]:
-    bad = []
-    alt_sources = {
-        # Try alternative sources per language if LDNOOBW lacks it
-        "si": [
-            # Add more known sources here if available publicly
-            # Example mirrors or community lists (may or may not exist at runtime)
-            "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master/si",  # original attempt
-            "https://raw.githubusercontent.com/zoomination/multilingual-profanity/main/lists/si.txt",
-            "https://raw.githubusercontent.com/zoomination/multilingual-profanity/master/lists/si.txt",
-        ],
-        "en": [
-            f"{repo_base}/en",
-        ],
-    }
+    """
+    Download bad words for the given language codes.
+    - For 'en': use LDNOOBW (try both with/without .txt).
+    - For 'si': LDNOOBW doesn't host Sinhala; pull from MRVLS unicode + singlish lists and known mirrors.
+    """
+    bad: List[str] = []
+
+    def _fetch_lines(url: str) -> List[str]:
+        try:
+            with urllib.request.urlopen(url) as r:
+                return [
+                    line.strip()
+                    for line in r.read().decode("utf-8", errors="ignore").splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+        except Exception as e:
+            logging.warning(f"[wordlist] Failed to download {url}: {e}")
+            return []
+
     for lang in langs:
-        tried = False
-        # Primary URL pattern
-        primary_url = f"{repo_base}/{lang.strip()}"
-        for url in [primary_url] + alt_sources.get(lang.strip(), []):
-            if tried and url == primary_url:
-                continue
-            tried = True
-            try:
-                logging.info(f"[wordlist] Downloading bad words for '{lang}' from {url}")
-                with urllib.request.urlopen(url) as r:
-                    for line in r.read().decode("utf-8", errors="ignore").splitlines():
-                        w = line.strip()
-                        if not w or w.startswith("#"):
-                            continue
-                        bad.append(w)
-                break  # success for this lang
-            except Exception as e:
-                logging.warning(f"[wordlist] Failed to download {url}: {e}")
-                continue
+        lang = lang.strip().lower()
+        if not lang:
+            continue
+
+        if lang == "si":
+            # Primary sources: MRVLS Sinhala lists (unicode + singlish)
+            candidates = [
+                # Unicode Sinhala bad words
+                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-unicode.txt",
+                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-unicode.txt",
+                # Singlish transliteration
+                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-singlish.txt",
+                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-singlish.txt",
+            ]
+            got_any = False
+            for u in candidates:
+                lines = _fetch_lines(u)
+                if lines:
+                    bad.extend(lines)
+                    got_any = True
+            if not got_any:
+                logging.warning("[wordlist] No Sinhala lists were fetched; will rely on built-in minimal set later.")
+            continue
+
+        # English and other languages via LDNOOBW
+        if lang == "en":
+            candidates = [
+                f"{repo_base}/en",
+                f"{repo_base}/en.txt",
+                repo_base.replace("master", "main") + "/en",
+                repo_base.replace("master", "main") + "/en.txt",
+            ]
+        else:
+            candidates = [
+                f"{repo_base}/{lang}",
+                f"{repo_base}/{lang}.txt",
+                repo_base.replace("master", "main") + f"/{lang}",
+                repo_base.replace("master", "main") + f"/{lang}.txt",
+            ]
+
+        for url in candidates:
+            lines = _fetch_lines(url)
+            if lines:
+                bad.extend(lines)
+                break
+
     # Deduplicate, keep order
     seen = set()
     uniq = []
@@ -704,6 +736,17 @@ def main():
         }
 
     # Training args
+    # Transformers v5 renamed 'evaluation_strategy' -> 'eval_strategy'.
+    try:
+        from transformers import __version__ as _tfv
+    except Exception:
+        _tfv = "0.0.0"
+    try:
+        major_ver = int(_tfv.split(".")[0])
+    except Exception:
+        major_ver = 4
+    eval_key = "eval_strategy" if major_ver >= 5 else "evaluation_strategy"
+
     training_kwargs = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
@@ -714,8 +757,6 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         warmup_ratio=args.warmup_ratio,
         logging_steps=args.logging_steps,
-        evaluation_strategy="steps",
-        eval_steps=args.eval_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
         report_to="none",
@@ -725,6 +766,9 @@ def main():
         push_to_hub=args.push_to_hub,
         hub_model_id=args.hub_model_id,
     )
+    training_kwargs[eval_key] = "steps"
+    training_kwargs["eval_steps"] = args.eval_steps
+
     if has_cuda:
         training_kwargs.update(
             dict(
