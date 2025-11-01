@@ -818,7 +818,13 @@ def main():
     collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
 
     # Labels/config
-    num_labels = int(max(int(max(ds["train"][args.label_column])), int(max(ds["validation"][args.label_column])))) + 1
+    try:
+        train_max = int(max(ds["train"][args.label_column]))
+        val_max = int(max(ds["validation"][args.label_column]))
+        num_labels = max(train_max, val_max) + 1
+    except Exception:
+        # Fallback in case of empty dataset or unexpected types
+        num_labels = 2
     config = AutoConfig.from_pretrained(active_model_id, num_labels=num_labels)
 
     # Model loading (GPU QLoRA vs CPU)
