@@ -75,14 +75,15 @@ def tokenize(text: str) -> Tuple[List[str], List[str]]:
 
 def _expand_mirrors(url: str) -> List[str]:
     """
-    Expand a raw.githubusercontent.com URL to include CDN mirrors (jsDelivr).
+    Expand a raw.githubusercontent.com URL to include CDN mirrors (jsDelivr, fastgit, githack).
     """
     urls = [url]
     m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)", url)
     if m:
         user, repo, branch, path = m.groups()
-        cdn = f"https://cdn.jsdelivr.net/gh/{user}/{repo}@{branch}/{path}"
-        urls.append(cdn)
+        urls.append(f"https://cdn.jsdelivr.net/gh/{user}/{repo}@{branch}/{path}")
+        urls.append(f"https://raw.fastgit.org/{user}/{repo}/{branch}/{path}")
+        urls.append(f"https://rawcdn.githack.com/{user}/{repo}/{branch}/{path}")
     return urls
 
 
@@ -126,6 +127,13 @@ def fetch_text_lines(url: str, timeout: int = 20) -> List[str]:
 
 
 def load_en_bad_words() -> Set[str]:
+    override = os.getenv("BAD_WORDS_EN_URL", "").strip()
+    if override:
+        logger.info("Loading English bad words from override URL: %s", override)
+        words = {w.lower() for w in fetch_text_lines(override)}
+        logger.info("Loaded %d English bad words (override)", len(words))
+        return words
+
     logger.info("Loading English bad words (LDNOOBW)...")
     urls = [
         "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master/en.txt",
@@ -137,50 +145,62 @@ def load_en_bad_words() -> Set[str]:
             words.add(w.lower())
         if words:
             break
+    if not words:
+        logger.warning("LDNOOBW fetch failed; English list is empty. Set BAD_WORDS_EN_URL or ensure GitHub raw access.")
     logger.info("Loaded %d English bad words", len(words))
     return words
 
 
 def load_si_bad_words_mrmrvl() -> Tuple[Set[str], Set[str]]:
     logger.info("Loading Sinhala MRVLS lists (unicode + singlish)...")
-    candidates_unicode = [
-        "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-unicode.txt",
-        "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-unicode.txt",
-        "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/unicode.txt",
-        "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/unicode.txt",
-    ]
-    candidates_singlish = [
-        "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-singlish.txt",
-        "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-singlish.txt",
-        "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/singlish.txt",
-        "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/singlish.txt",
-    ]
+
+    # Allow override URLs to ensure we can use your own curated lists
+    override_si = os.getenv("BAD_WORDS_SI_URL", "").strip()
+    override_si_sing = os.getenv("BAD_WORDS_SI_SINGLISH_URL", "").strip()
     si_unicode: Set[str] = set()
     si_singlish: Set[str] = set()
 
-    for u in candidates_unicode:
-        for w in fetch_text_lines(u):
+    if override_si:
+        logger.info("Loading Sinhala (unicode) from override URL: %s", override_si)
+        for w in fetch_text_lines(override_si):
             si_unicode.add(w)
-        if si_unicode:
-            break
-
-    for u in candidates_singlish:
-        for w in fetch_text_lines(u):
+    if override_si_sing:
+        logger.info("Loading Sinhala (singlish) from override URL: %s", override_si_sing)
+        for w in fetch_text_lines(override_si_sing):
             si_singlish.add(w.lower())
-        if si_singlish:
-            break
+
+    if not si_unicode or not si_singlish:
+        candidates_unicode = [
+            "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-unicode.txt",
+            "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-unicode.txt",
+            "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/unicode.txt",
+            "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/unicode.txt",
+        ]
+        candidates_singlish = [
+            "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-singlish.txt",
+            "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-singlish.txt",
+            "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/singlish.txt",
+            "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/singlish.txt",
+        ]
+
+        if not si_unicode:
+            for u in candidates_unicode:
+                for w in fetch_text_lines(u):
+                    si_unicode.add(w)
+                if si_unicode:
+                    break
+
+        if not si_singlish:
+            for u in candidates_singlish:
+                for w in fetch_text_lines(u):
+                    si_singlish.add(w.lower())
+                if si_singlish:
+                    break
 
     if not si_unicode:
-        # Minimal Sinhala Unicode seed (extend as needed)
-        si_unicode.update({
-            "උබාදේ", "පකයා", "බඩොන්", "හරපෝ", "කෙවලා",  # placeholder examples
-        })
-        logger.warning("MRVLS unicode fetch failed; using built-in Sinhala unicode seed list (%d words).", len(si_unicode))
+        logger.warning("MRVLS unicode fetch failed and no override provided; Sinhala unicode list is empty.")
     if not si_singlish:
-        si_singlish.update({
-            "pakaya", "kariya", "harak", "baduwa", "kapanna",  # placeholder examples
-        })
-        logger.warning("MRVLS singlish fetch failed; using built-in Sinhala singlish seed list (%d words).", len(si_singlish))
+        logger.warning("MRVLS singlish fetch failed and no override provided; Sinhala singlish list is empty.")
 
     logger.info("Loaded Sinhala MRVLS: unicode=%d singlish=%d", len(si_unicode), len(si_singlish))
     return si_unicode, si_singlish
@@ -190,6 +210,7 @@ def load_si_bad_words_sold() -> Set[str]:
     """
     Load token-level offensive Sinhala words from SOLD rationales.
     Controlled by USE_SOLD env var (default: enabled).
+    Tries multiple possible field names to be robust to schema differences.
     """
     if os.getenv("USE_SOLD", "1").lower() not in {"1", "true", "yes"}:
         logger.info("USE_SOLD disabled; skipping SOLD load.")
@@ -215,11 +236,35 @@ def load_si_bad_words_sold() -> Set[str]:
         split = sold.get(split_name)
         if split is None:
             continue
+
+        # Inspect first row to infer keys
+        try:
+            first = split[0]
+            available_keys = list(first.keys())
+            logger.info("SOLD %s available keys: %s", split_name, available_keys)
+        except Exception:
+            pass
+
         for item in split:
-            tokens = item.get("tokens")
-            rationals = item.get("rationals")
+            # tokens may be in one of these fields
+            tokens_field_candidates = ["tokens", "token", "words", "word_tokens"]
+            tokens = None
+            for k in tokens_field_candidates:
+                if item.get(k) is not None:
+                    tokens = item.get(k)
+                    break
+
+            # rationals may be in one of these fields
+            rational_field_candidates = ["rationals", "rationales", "rationale", "rationale_labels", "rational_labels"]
+            rationals = None
+            for k in rational_field_candidates:
+                if item.get(k) is not None:
+                    rationals = item.get(k)
+                    break
+
             if not tokens or rationals is None:
                 continue
+
             if isinstance(tokens, str):
                 toks = tokens.split()
             else:
@@ -228,6 +273,7 @@ def load_si_bad_words_sold() -> Set[str]:
                 rats = [int(x) for x in rationals.split()]
             else:
                 rats = [int(x) for x in rationals]
+
             for t, r in zip(toks, rats):
                 if r == 1:
                     words.add(t)
