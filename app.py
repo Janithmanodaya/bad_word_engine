@@ -6,6 +6,7 @@ from typing import List, Set, Tuple
 from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter, Retry
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
@@ -72,17 +73,55 @@ def tokenize(text: str) -> Tuple[List[str], List[str]]:
     return latin_tokens, sinhala_tokens
 
 
-def fetch_text_lines(url: str, timeout: int = 15) -> List[str]:
-    logger.info("Downloading list from %s", url)
-    try:
-        r = requests.get(url, timeout=timeout)
-        if r.status_code == 200 and r.text:
-            lines = [line.strip() for line in r.text.splitlines() if line.strip()]
-            logger.info("Fetched %d lines from %s", len(lines), url)
-            return lines
-        logger.warning("Non-200 response from %s: %s", url, r.status_code)
-    except Exception as e:
-        logger.warning("Failed to fetch %s: %s", url, e)
+def _expand_mirrors(url: str) -> List[str]:
+    """
+    Expand a raw.githubusercontent.com URL to include CDN mirrors (jsDelivr).
+    """
+    urls = [url]
+    m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)", url)
+    if m:
+        user, repo, branch, path = m.groups()
+        cdn = f"https://cdn.jsdelivr.net/gh/{user}/{repo}@{branch}/{path}"
+        urls.append(cdn)
+    return urls
+
+
+def _requests_session() -> requests.Session:
+    session = requests.Session()
+    retries = Retry(
+        total=5,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    headers = {
+        "User-Agent": "badwords-service/1.0 (+https://example.local)",
+        "Accept": "text/plain,*/*;q=0.8",
+    }
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    session.headers.update(headers)
+    return session
+
+
+def fetch_text_lines(url: str, timeout: int = 20) -> List[str]:
+    session = _requests_session()
+    for candidate in _expand_mirrors(url):
+        logger.info("Downloading list from %s", candidate)
+        try:
+            r = session.get(candidate, timeout=timeout)
+            if r.status_code == 200 and r.text:
+                lines = [line.strip() for line in r.text.splitlines() if line.strip()]
+                logger.info("Fetched %d lines from %s", len(lines), candidate)
+                return lines
+            logger.warning("Non-200 response from %s: %s", candidate, r.status_code)
+        except Exception as e:
+            logger.warning("Failed to fetch %s: %s", candidate, e)
     return []
 
 
@@ -325,6 +364,12 @@ def init_lexicons() -> None:
         os.getenv("USE_SOLD", "1"),
         os.getenv("USE_SEMISOLD", "0"),
     )
+    if len(BAD_WORDS_EN) == 0:
+        logger.warning("English lexicon is empty. Check network access to raw.githubusercontent.com or set GITHUB_TOKEN.")
+    if len(BAD_WORDS_SI) == 0:
+        logger.warning("Sinhala unicode lexicon is empty. Check MRVLS URLs and SOLD availability.")
+    if len(BAD_WORDS_SI_SINGLISH) == 0:
+        logger.warning("Sinhala singlish lexicon is empty. Check MRVLS singlish URLs.")
 
 
 def check_api_key(req: Request, expected_key: str) -> None:

@@ -2,19 +2,21 @@
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HF_HUB_DISABLE_TELEMETRY=1
 
 WORKDIR /app
 
-# Install dependencies first (better layer caching)
+# System dependencies: CA certs for HTTPS downloads
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (better layer caching)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Optional: install Hugging Face datasets if you want SOLD-derived tokens
-# RUN pip install --no-cache-dir datasets
-
 # Copy application code
 COPY app.py /app/app.py
+COPY client_tk.py /app/client_tk.py
 
 # Default server binding; override via SERVER_URL env var
 ENV SERVER_URL=0.0.0.0:8000
