@@ -454,6 +454,41 @@ def load_custom_words_from_env() -> Tuple[Set[str], Set[str], Set[str]]:
 
     return en, si, si_sing
 
+def load_additional_si_bad_csv(path: str = "bad.csv") -> Set[str]:
+    """
+    Load comma-separated Sinhala bad words from a local CSV file.
+    """
+    words: Set[str] = set()
+    try:
+        if not path:
+            return words
+        p = path.strip()
+        if not os.path.exists(p) or not os.path.isfile(p):
+            return words
+        import csv
+        with open(p, "r", encoding="utf-8") as f:
+            content = f.read()
+        import re as _re
+        tokens = [tok.strip() for tok in _re.split(r"[,\n;]+", content) if tok.strip()]
+        try:
+            with open(p, "r", encoding="utf-8", newline="") as f2:
+                reader = csv.reader(f2, delimiter=",")
+                for row in reader:
+                    for cell in row:
+                        cell = cell.strip()
+                        if cell:
+                            tokens.append(cell)
+        except Exception:
+            pass
+        for w in tokens:
+            w_norm = unicodedata.normalize("NFKC", w)
+            if w_norm:
+                words.add(w_norm)
+        logger.info("Loaded %d Sinhala bad words from CSV: %s", len(words), p)
+    except Exception as e:
+        logger.warning("Failed to load extra Sinhala bad words CSV '%s': %s", path, e)
+    return words
+
 
 def build_automaton(words: Set[str]) -> Optional[object]:
     if not HAS_AHO:
@@ -521,14 +556,15 @@ def init_lexicons() -> None:
 
     # Build Sinhala set and apply stopword filter, include built-in defaults
     BAD_WORDS_SI = set(DEFAULT_SI_BAD_WORDS)
-    for w in si_unicode_mrmrvl.union(si_sold).union(si_semisold):
+    # Include additional Sinhala words from local CSV (bad.csv by default)
+    si_extra_csv = load_additional_si_bad_csv(os.getenv("BAD_CSV_PATH", "bad.csv"))
+    for w in si_unicode_mrmrvl.union(si_sold).union(si_semisold).union(si_extra_csv):
         w_norm = unicodedata.normalize("NFKC", w)
-        if len(w_norm) < 3:
+        if len(w_norm <) 3:
             continue
         if w_norm in SINHALA_STOPWORDS:
             continue
-        BAD_WORDS_SI.add(w_norm)
-
+        BAD_WORDS_S
     # Singlish set (lowercased) include built-in defaults
     BAD_WORDS_SI_SINGLISH = set(x.lower() for x in DEFAULT_SINGLISH_BAD_WORDS)
     for w in si_singlish_mrmrvl:

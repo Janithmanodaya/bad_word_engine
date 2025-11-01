@@ -480,6 +480,46 @@ def normalize_text(t: str) -> str:
             pass
     return s
 
+def load_additional_bad_csv(path: str) -> List[str]:
+    """
+    Load comma-separated Sinhala bad words from a CSV file.
+    Returns a list of normalized strings.
+    """
+    words: List[str] = []
+    if not path or not os.path.exists(path) or not os.path.isfile(path):
+        return words
+    try:
+        import csv
+        with open(path, "r", encoding="utf-8") as f:
+            # Read entire file and split robustly on commas/newlines
+            text = f.read()
+        # Fallback simple split to handle irregular formatting
+        import re
+        tokens = [tok.strip() for tok in re.split(r"[,\n;]+", text) if tok.strip()]
+        # Also try csv reader for quoted entries
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as f2:
+                reader = csv.reader(f2, delimiter=",")
+                for row in reader:
+                    for cell in row:
+                        cell = cell.strip()
+                        if cell:
+                            tokens.append(cell)
+        except Exception:
+            pass
+        # Deduplicate while preserving order
+        seen = set()
+        for w in tokens:
+            wl = w.strip()
+            if not wl:
+                continue
+            if wl not in seen:
+                seen.add(wl)
+                words.append(wl)
+    except Exception as e:
+        logging.warning("[extra_bad_csv] Failed to load %s: %s", path, e)
+    return words
+
 # ---------------------------
 # Training (scikit-learn)
 # ---------------------------
@@ -634,6 +674,8 @@ def main():
     parser.add_argument("--val_size", type=float, default=0.1)
     parser.add_argument("--model_choice", type=str, choices=["sklearn", "fasttext"], default="sklearn", help="Choose simple ML model.")
     parser.add_argument("--num_train_epochs", type=int, default=5, help="Used by FastText (ignored for sklearn).")
+    # Extra Sinhala bad words CSV (comma-separated) to augment training
+    parser.add_argument("--extra_bad_csv", type=str, default="bad.csv", help="Comma-separated Sinhala bad words CSV to augment training.")
     # SOLD dataset
     parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub. If hub load fails, fallback to parquet or local TSV files.")
     parser.add_argument("--sold_parquet_train_api", type=str, default="https://huggingface.co/api/datasets/sinhala-nlp/SOLD/parquet/default/train", help="API endpoint to fetch parquet URLs for SOLD train split.")
@@ -725,6 +767,33 @@ def main():
     y_train = [int(x) for x in ds["train"][args.label_column]]
     X_val_raw = [str(x) if x is not None else "" for x in ds["validation"][args.text_column]]
     y_val = [int(x) for x in ds["validation"][args.label_column]]
+
+    # Augment training with additional Sinhala bad words from CSV if available
+    extra_bad_path = args.extra_bad_csv
+    def _make_contexts(w: str) -> List[str]:
+        if args.augment_context:
+            return [w, f"You are {w}.", f"That was {w}!", f"{w} behavior."]
+        return [w]
+    try:
+        extra_words = []
+        if extra_bad_path and os.path.exists(extra_bad_path) and os.path.isfile(extra_bad_path):
+            from unicodedata import normalize as _normalize
+            extra_words = [ _normalize("NFKC", w) for w in load_additional_bad_csv(extra_bad_path) if w ]
+            # Deduplicate
+            seen = set()
+            extra_words = [w for w in extra_words if not (w in seen or seen.add(w))]
+        if extra_words:
+            added = 0
+            for w in extra_words:
+                for t in _make_contexts(w):
+                    X_train_raw.append(t)
+                    y_train.append(1)
+                    added += 1
+            logging.info("[extra_bad_csv] Augmented training with %d examples from %d Sinhala bad words (%s).", added, len(extra_words), extra_bad_path)
+        else:
+            logging.info("[extra_bad_csv] No extra bad words found at %s (skipping).", extra_bad_path)
+    except Exception as e:
+        logging.warning("[extra_bad_csv] Failed to augment training: %s", e)
 
     logging.info("=" * 70)
     logging.info("DATASET SUMMARY BEFORE TRAINING")
