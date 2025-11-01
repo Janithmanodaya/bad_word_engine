@@ -559,7 +559,22 @@ def main():
         logging.warning(f"Failed to log dataset stats: {e}")
 
     def tokenize_fn(batch):
-        toks = tokenizer(batch[args.text_column], max_length=args.max_length, truncation=True)
+        # Normalize inputs for tokenizer: ensure list of strings
+        texts = batch.get(args.text_column)
+        if not isinstance(texts, list):
+            texts = [texts]
+        safe_texts = []
+        for t in texts:
+            if t is None:
+                safe_texts.append("")
+            elif isinstance(t, str):
+                safe_texts.append(t)
+            else:
+                try:
+                    safe_texts.append(str(t))
+                except Exception:
+                    safe_texts.append("")
+        toks = tokenizer(safe_texts, max_length=args.max_length, truncation=True)
         toks["labels"] = batch[args.label_column]
         return toks
 
