@@ -841,8 +841,9 @@ def main():
                 # Summarize download results for clear verification in logs
                 _summarize_downloads()
 
-        # Dataset presence or download otherwise
-        dataset_path = maybe_download_dataset(dataset_path, args.dataset_url)
+        # Dataset presence or download otherwise (only if still not using SOLD)
+        if not args.use_sold:
+            dataset_path = maybe_download_dataset(dataset_path, args.dataset_url)
 
     # Environment checks
     has_cuda = torch.cuda.is_available()
