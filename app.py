@@ -605,24 +605,69 @@ def _prepare_unpickle_namespace() -> None:
         logger.warning("Failed to prepare unpickle namespace: %s", e)
 
 
+def _discover_model_path() -> Optional[str]:
+    """
+    Try multiple locations to find model.joblib:
+    - $MODEL_DIR/model.joblib
+    - ./model/model.joblib
+    - ./outputs/badwords-ml/model.joblib
+    - Path declared in ./model/inference_card.json (model_path/model.joblib)
+    """
+    candidates: List[str] = []
+
+    # Env override
+    env_dir = os.getenv("MODEL_DIR", "").strip()
+    if env_dir:
+        candidates.append(os.path.join(env_dir, "model.joblib"))
+
+    # Standard repo locations
+    candidates.append(os.path.join("model", "model.joblib"))
+    candidates.append(os.path.join("outputs", "badwords-ml", "model.joblib"))
+
+    # Read inference card for model_path
+    try:
+        card_path = os.path.join("model", "inference_card.json")
+        if os.path.exists(card_path):
+            import json
+            with open(card_path, "r", encoding="utf-8") as f:
+                card = json.load(f)
+            mdir = str(card.get("model_path", "")).strip()
+            if mdir:
+                candidates.append(os.path.join(mdir, "model.joblib"))
+    except Exception as e:
+        logger.warning("Failed to read inference_card.json: %s", e)
+
+    # Deduplicate while preserving order
+    seen = set()
+    uniq = []
+    for p in candidates:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+
+    for p in uniq:
+        if os.path.exists(p) and os.path.isfile(p):
+            return p
+    logger.info("Model discovery: none of candidates exist: %s", ", ".join(uniq))
+    return None
+
+
 def load_model() -> None:
-    """Load joblib model bundle from MODEL_DIR (default: ./model/model.joblib)."""
+    """Load joblib model bundle using discovered path."""
     global MODEL_AVAILABLE, MODEL_PATH, _model_bundle
     MODEL_AVAILABLE = False
     _model_bundle = None
 
-    model_dir = os.getenv("MODEL_DIR", "model").strip() or "model"
-    model_file = os.path.join(model_dir, "model.joblib")
-    MODEL_PATH = model_file
-    if not os.path.exists(model_file):
-        logger.info("Model file not found at %s; ML detector disabled.", model_file)
+    model_file = _discover_model_path()
+    if not model_file:
+        logger.info("Model file not found; ML detector disabled.")
         return
 
+    MODEL_PATH = model_file
     try:
         _prepare_unpickle_namespace()
         from joblib import load as joblib_load  # type: ignore
         _model_bundle = joblib_load(model_file)
-        # Sanity check
         for key in ("vec_char", "vec_word", "classifier"):
             if key not in _model_bundle:
                 raise ValueError(f"Model bundle missing '{key}'")
