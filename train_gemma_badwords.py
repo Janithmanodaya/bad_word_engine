@@ -51,18 +51,38 @@ REQUIRED_PKGS = [
     "accelerate",
     "evaluate",
     "scikit-learn",
-    # torch: installing CPU-only by default if missing. For CUDA, user can pre-install.
-    "torch",
 ]
 
-def _pip_install(spec: str) -> None:
-    logging.getLogger("setup").info(f"Installing: {spec}")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", spec])
+def _pip_install(args: list) -> None:
+    logging.getLogger("setup").info(f"Installing: {' '.join(args)}")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade"] + args)
 
 def _is_installed(module: str) -> bool:
     return importlib.util.find_spec(module) is not None
 
+def _install_torch_best_effort():
+    # If torch is installed, nothing to do
+    if _is_installed("torch"):
+        return
+    try:
+        # Prefer CUDA wheel if NVIDIA driver present
+        has_nvidia = shutil.which("nvidia-smi") is not None
+        if has_nvidia:
+            # Default to CUDA 12.1 wheels which work on recent GPUs
+            _pip_install(["torch", "--index-url", "https://download.pytorch.org/whl/cu121"])
+        else:
+            _pip_install(["torch"])
+    except subprocess.CalledProcessError as e:
+        print(f"[setup] WARNING: torch install failed: {e}. Trying CPU wheel.")
+        try:
+            _pip_install(["torch"])
+        except Exception as e2:
+            print(f"[setup] WARNING: torch CPU install also failed: {e2}. Continuing; training may not work.")
+
 def ensure_dependencies():
+    # Torch first (chooses CUDA wheel if possible)
+    _install_torch_best_effort()
+
     missing = []
     # Map import names for some pkgs
     import_name_map = {
@@ -75,22 +95,17 @@ def ensure_dependencies():
             missing.append(spec)
 
     if missing:
-        print("[setup] Missing dependencies detected. Attempting installation...")
-        # Special handling: install torch first to satisfy others (avoid bnb building wheels before torch)
-        torch_specs = [s for s in missing if s.startswith("torch")]
-        other_specs = [s for s in missing if not s.startswith("torch")]
-        for spec in torch_specs + other_specs:
+        print("[setup] Installing missing dependencies...")
+        for spec in missing:
             try:
-                _pip_install(spec)
+                _pip_install([spec])
             except subprocess.CalledProcessError as e:
                 print(f"[setup] WARNING: Failed to install {spec}: {e}")
-                # Continue; some environments may still work if the package is optional
 
-    # Final check
-    for spec in REQUIRED_PKGS:
-        mod_name = import_name_map.get(spec, spec.split("==")[0].split(">=")[0])
-        if not _is_installed(mod_name):
-            print(f"[setup] WARNING: {spec} still not importable. The script may fail if this is required.")
+    # Final check logging
+    for spec in REQUIRED_PKGS + ["torch"]:
+        name = spec.split("==")[0].split(">=")[0]
+        print(f"[setup] {name}: {'OK' if _is_installed(name) else 'MISSING'}")
 
 ensure_dependencies()
 
@@ -320,15 +335,15 @@ def build_dataset(path: str, text_col: str, label_col: str, seed: int, val_size:
 
 def main():
     parser = argparse.ArgumentParser(description="Self-installing QLoRA trainer for Gemma bad-word classification.")
-    parser.add_argument("--dataset_path", type=str, required=True, help="Path to CSV/JSON/JSONL with text+label columns.")
+    parser.add_argument("--dataset_path", type=str, default="data/auto_badwords_en_si.csv", help="Path to CSV/JSON/JSONL with text+label columns.")
     parser.add_argument("--dataset_url", type=str, default=None, help="Optional URL to download dataset if dataset_path is missing.")
     # Auto wordlist options
-    parser.add_argument("--auto_wordlists", action="store_true", help="Build dataset automatically from public word lists.")
-    parser.add_argument("--bad_words_langs", type=str, default="en", help="Comma-separated languages for bad-word lists (e.g., 'en,es,de').")
+    parser.add_argument("--auto_wordlists", action="store_true", default=True, help="Build dataset automatically from public word lists.")
+    parser.add_argument("--bad_words_langs", type=str, default="en,si", help="Comma-separated languages for bad-word lists (e.g., 'en,si').")
     parser.add_argument("--bad_words_repo_url", type=str, default=DEFAULT_BADWORDS_REPO, help="Base repo URL for bad-word lists.")
     parser.add_argument("--clean_words_url", type=str, default=DEFAULT_CLEANWORDS_URL, help="URL for clean words list.")
     parser.add_argument("--wordlist_clean_limit", type=int, default=10000, help="Max number of clean words to use.")
-    parser.add_argument("--augment_context", action="store_true", help="Wrap words into short sentences for better generalization.")
+    parser.add_argument("--augment_context", action="store_true", default=True, help="Wrap words into short sentences for better generalization.")
     parser.add_argument("--regenerate_wordlist", action="store_true", help="Rebuild dataset CSV from wordlists even if file exists.")
     # Training/data params
     parser.add_argument("--text_column", type=str, default="text", help="Name of the text column.")
@@ -355,7 +370,7 @@ def main():
     parser.add_argument("--push_to_hub", action="store_true")
     parser.add_argument("--hub_model_id", type=str, default=None)
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory.")
-    parser.add_argument("--preset", type=str, choices=["base", "low_vram"], default="base", help="Convenience presets for VRAM.")
+    parser.add_argument("--preset", type=str, choices=["base", "low_vram"], default="low_vram", help="Convenience presets for VRAM.")
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
     args = parser.parse_args()
 
