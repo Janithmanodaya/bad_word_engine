@@ -685,6 +685,8 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory.")
     parser.add_argument("--preset", type=str, choices=["small_cls"], default="small_cls", help="Use compact classifier model (no LoRA/4-bit).")
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
+    # Inference size/perf options
+    parser.add_argument("--quantize_int8", action="store_true", help="After training, save an INT8-quantized model to reduce file size for CPU/mobile inference.")
     # GPU preference/validation
     parser.add_argument("--require_gpu_name", type=str, default="", help="If set, require that CUDA device name contains this substring (e.g., 'T4').")
     parser.add_argument("--enforce_gpu_name", action="store_true", help="If true and require_gpu_name set, exit if the CUDA device name doesn't match.")
@@ -1174,6 +1176,40 @@ def main():
     trainer.model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
+    # Optionally save an INT8-quantized model for smaller file size (CPU/mobile-friendly)
+    if args.quantize_int8:
+        try:
+            logging.info("Quantizing model to INT8 (dynamic) for lightweight deployment...")
+            # move to CPU for quantization
+            model_cpu = trainer.model.to("cpu")
+            # Support both torch.quantization and torch.ao.quantization namespaces
+            try:
+                from torch.quantization import quantize_dynamic  # type: ignore
+            except Exception:
+                from torch.ao.quantization import quantize_dynamic  # type: ignore
+
+            import torch.nn as nn
+            q_model = quantize_dynamic(model_cpu, {nn.Linear}, dtype=torch.qint8)
+            q_out_dir = os.path.join(args.output_dir, "int8")
+            os.makedirs(q_out_dir, exist_ok=True)
+            q_model.save_pretrained(q_out_dir)
+            tokenizer.save_pretrained(q_out_dir)
+            # Log size comparison if safetensors present
+            def _file_size(path: str) -> int:
+                try:
+                    return os.path.getsize(path)
+                except Exception:
+                    return -1
+            orig_path = os.path.join(args.output_dir, "model.safetensors")
+            q_path = os.path.join(q_out_dir, "model.safetensors")
+            s_orig = _file_size(orig_path)
+            s_q = _file_size(q_path)
+            if s_orig > 0 and s_q > 0:
+                logging.info("Model size: original=%.2f MB, int8=%.2f MB", s_orig / (1024 * 1024), s_q / (1024 * 1024))
+            logging.info("INT8 model saved to: %s", q_out_dir)
+        except Exception as e:
+            logging.warning("INT8 quantization failed: %s", e)
+
     # Export minimal inference card
     card = {
         "base_model": active_model_id,
@@ -1186,11 +1222,14 @@ def main():
         "notes": "This is a compact classifier fine-tuned for bad-word detection (no LoRA/quant).",
         "train_seconds": round(t1 - t0, 2),
         "preset": args.preset,
+        "quantized_int8": bool(getattr(args, "quantize_int8", False)),
     }
     with open(os.path.join(args.output_dir, "inference_card.json"), "w", encoding="utf-8") as f:
         json.dump(card, f, indent=2)
 
     print(f"Training complete in {round(t1 - t0, 2)}s. Model saved to: {args.output_dir}")
+    if args.quantize_int8:
+        print(f"INT8-quantized model saved to: {os.path.join(args.output_dir, 'int8')}")
 
 
 if __name__ == "__main__":
