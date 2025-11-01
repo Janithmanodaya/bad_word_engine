@@ -521,9 +521,7 @@ def main():
         active_model_id = args.fallback_model
 
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_tokenkenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_t_codeoknewe</n
-en
+        tokenizer.pad_token = tokenizer.eos_token
 
     # Dataset
     ds = build_dataset(dataset_path, args.text_column, args.label_column, seed=args.seed, val_size=args.val_size)
