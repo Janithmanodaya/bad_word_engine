@@ -655,7 +655,7 @@ def main():
     parser.add_argument("--auto_wordlists", action="store_true", default=True, help="Build dataset automatically from public word lists.")
     parser.add_argument("--bad_words_langs", type=str, default="en,si", help="Comma-separated languages for bad-word lists (e.g., 'en,si').")
     parser.add_argument("--bad_words_repo_url", type=str, default=DEFAULT_BADWORDS_REPO, help="Base repo URL for bad-word lists.")
-    parser.add_argument("--si_wordlist_urls", type=str, default="", help="Comma-separated custom URLs for Sinhala bad-word lists (unicode/singlish).")
+    parser.add_argument("--si_wordlist_urls", type=str, default=os.environ.get("SI_WORDLIST_URLS", ""), help="Comma-separated custom URLs for Sinhala bad-word lists (unicode/singlish). Can also be a local file path containing one URL per line.")
     parser.add_argument("--clean_words_url", type=str, default=DEFAULT_CLEANWORDS_URL, help="URL for clean words list.")
     parser.add_argument("--wordlist_clean_limit", type=int, default=10000, help="Max number of clean words to use.")
     parser.add_argument("--augment_context", action="store_true", default=True, help="Wrap words into short sentences for better generalization.")
@@ -817,11 +817,19 @@ def main():
     if not args.use_sold:
         if args.auto_wordlists and (args.regenerate_wordlist or not os.path.exists(dataset_path)):
             langs = [s.strip() for s in args.bad_words_langs.split(",") if s.strip()]
-            si_urls = [s.strip() for s in (args.si_wordlist_urls or "").split(",") if s.strip()] or None
+            si_urls_list = None
+            raw_si = (args.si_wordlist_urls or "").strip()
+            if raw_si:
+                # Allow a local file path containing one URL per line, or a comma-separated list directly
+                if os.path.exists(raw_si) and os.path.isfile(raw_si):
+                    with open(raw_si, "r", encoding="utf-8") as f:
+                        si_urls_list = [ln.strip() for ln in f if ln.strip()]
+                else:
+                    si_urls_list = [s.strip() for s in raw_si.split(",") if s.strip()]
             # STRICT: if Sinhala requested, URLs must be provided
-            if any(l.lower() == "si" for l in langs) and not si_urls:
-                raise SystemExit("Sinhala language requested in --bad_words_langs, but --si_wordlist_urls was not provided. Please supply exact Sinhala wordlist URLs.")
-            bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url, si_overrides=si_urls)
+            if any(l.lower() == "si" for l in langs) and not si_urls_list:
+                raise SystemExit("Sinhala language requested in --bad_words_langs, but --si_wordlist_urls was not provided. Please supply exact Sinhala wordlist URLs or a file path containing them.")
+            bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url, si_overrides=si_urls_list)
             clean_words = download_clean_words(url=args.clean_words_url, limit=args.wordlist_clean_limit)
             if not bad_words:
                 logging.warning("[wordlist] No bad words downloaded; training may not be meaningful.")
