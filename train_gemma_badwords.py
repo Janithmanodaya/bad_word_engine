@@ -179,6 +179,20 @@ except Exception:
 DEFAULT_BADWORDS_REPO = "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master"
 DEFAULT_CLEANWORDS_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt"
 
+# Built-in minimal Sinhala bad-word list (Unicode + common transliterations).
+# NOTE: This is a starter list to ensure training does not fail when remote sources are unavailable.
+# You should extend/curate this list for production.
+BUILTIN_SINHALA_BADWORDS = [
+    # Unicode Sinhala (subset)
+    "පිස්සෝ", "පොල්ගහ", "පන්ති", "වහල්", "බයියා", "ගැම්ම", "තූහ", "හාඩියා", "කුක්කා", "අල්ලු", "අජාත",
+    "හරප්පු", "වැලිබ්බලා", "දුස්සි", "වටිනව", "නිවහ", "වැලිබිල්ලා", "හැලෙ", "පොන්නයා", "පොන්නි", "පන්නා", "හපන්න",
+    # Common Singlish/transliterations (subset)
+    "pissu", "harak", "kukkā", "kukkaa", "kukka", "kollo", "gon", "gonja", "gona", "ponna", "ponna", "ponnaya",
+    "hutta", "huththa", "mola", "mole", "pakaya", "pakka", "paka", "jathiya", "baya", "baiya", "wahal", "wahal",
+    # Variants and simple obfuscations
+    "p0nna", "g0n", "huththa", "huttha", "poonna",
+]
+
 # Simple download event log for clear PASS/FAIL reporting
 DOWNLOAD_EVENTS: List[dict] = []
 
@@ -210,11 +224,11 @@ def _summarize_downloads() -> None:
             logging.info(f"  [{status}] {e['url']}{extra}")
     logging.info("=" * 70)
 
-def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO) -> List[str]:
+def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO, si_overrides: Optional[List[str]] = None) -> List[str]:
     """
     Download bad words for the given language codes.
     - For 'en': use LDNOOBW (try both with/without .txt).
-    - For 'si': LDNOOBW doesn't host Sinhala; pull from MRVLS unicode + singlish lists and known mirrors.
+    - For 'si': try supplied si_overrides first, then multiple mirrors; if all fail, fall back to a built-in minimal list.
     """
     bad: List[str] = []
 
@@ -239,15 +253,27 @@ def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO)
             continue
 
         if lang == "si":
-            # Primary sources: MRVLS Sinhala lists (unicode + singlish)
-            candidates = [
-                # Unicode Sinhala bad words
+            # Prefer user-provided override URLs if any
+            candidates = []
+            if si_overrides:
+                for u in si_overrides:
+                    u = u.strip()
+                    if u:
+                        candidates.append(u)
+
+            # Known historical sources & mirrors
+            candidates.extend([
+                # MRVLS unicode/singlish lists (may 404 intermittently)
                 "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-unicode.txt",
                 "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-unicode.txt",
-                # Singlish transliteration
                 "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-singlish.txt",
                 "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-singlish.txt",
-            ]
+                # Alternate mirrors (community forks; may be transient)
+                "https://raw.githubusercontent.com/nuuuwan/sinhala-bad-words/master/sinhala-bad-words-unicode.txt",
+                "https://raw.githubusercontent.com/nuuuwan/sinhala-bad-words/master/sinhala-bad-words-singlish.txt",
+                # Generic list-of-bad-words style mirrors that include Sinhala sections (may require parsing)
+                "https://raw.githubusercontent.com/sanjayheaven/sinhala-bad-words/main/sinhala_bad_words.txt",
+            ])
             got_any = False
             for u in candidates:
                 lines = _fetch_lines("badwords:si", u)
@@ -255,7 +281,8 @@ def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO)
                     bad.extend(lines)
                     got_any = True
             if not got_any:
-                logging.warning("[wordlist] No Sinhala lists were fetched; will rely on built-in minimal set later.")
+                logging.warning("[wordlist] No Sinhala lists were fetched; using built-in minimal Sinhala list.")
+                bad.extend(BUILTIN_SINHALA_BADWORDS)
             continue
 
         # English and other languages via LDNOOBW
@@ -557,6 +584,7 @@ def main():
     parser.add_argument("--auto_wordlists", action="store_true", default=True, help="Build dataset automatically from public word lists.")
     parser.add_argument("--bad_words_langs", type=str, default="en,si", help="Comma-separated languages for bad-word lists (e.g., 'en,si').")
     parser.add_argument("--bad_words_repo_url", type=str, default=DEFAULT_BADWORDS_REPO, help="Base repo URL for bad-word lists.")
+    parser.add_argument("--si_wordlist_urls", type=str, default="", help="Comma-separated custom URLs for Sinhala bad-word lists (unicode/singlish).")
     parser.add_argument("--clean_words_url", type=str, default=DEFAULT_CLEANWORDS_URL, help="URL for clean words list.")
     parser.add_argument("--wordlist_clean_limit", type=int, default=10000, help="Max number of clean words to use.")
     parser.add_argument("--augment_context", action="store_true", default=True, help="Wrap words into short sentences for better generalization.")
@@ -711,7 +739,8 @@ def main():
     if not args.use_sold:
         if args.auto_wordlists and (args.regenerate_wordlist or not os.path.exists(dataset_path)):
             langs = [s.strip() for s in args.bad_words_langs.split(",") if s.strip()]
-            bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url)
+            si_urls = [s.strip() for s in (args.si_wordlist_urls or "").split(",") if s.strip()] or None
+            bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url, si_overrides=si_urls)
             clean_words = download_clean_words(url=args.clean_words_url, limit=args.wordlist_clean_limit)
             if not bad_words:
                 logging.warning("[wordlist] No bad words downloaded; training may not be meaningful.")
