@@ -226,8 +226,16 @@ def parse_host_port(url_str: str) -> Tuple[str, int]:
 
 
 if __name__ == "__main__":
-    server_url = os.getenv("SERVER_URL", "")
-    host, port = parse_host_port(server_url)
+    # Prefer platform-provided PORT, and always bind to 0.0.0.0 inside containers.
+    # Fallback to SERVER_URL only for the port if PORT is not set.
+    port_env = os.getenv("PORT")
+    if port_env and port_env.isdigit():
+        port = int(port_env)
+    else:
+        _, port = parse_host_port(os.getenv("SERVER_URL", ""))
+
+    host = os.getenv("HOST", "0.0.0.0")
+
     # Lazy import to avoid dependency if not running directly
     import uvicorn
 
