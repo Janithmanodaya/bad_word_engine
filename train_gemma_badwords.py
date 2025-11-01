@@ -409,11 +409,13 @@ class WeightedTrainer(Trainer):
         outputs = model(**inputs)
         logits = outputs.logits
         if self.class_weights is not None:
-            device = logits.device
-            weights = self.class_weights.to(device)
+            weights = self.class_weights.to(logits.device)
             loss_fct = torch.nn.CrossEntropyLoss(weight=weights)
         else:
-            loss_fct = torch.nn.Crossrn_outputs else loss
+            loss_fct = torch.nn.CrossEntropyLoss()
+        # Flatten in case of batched inputs
+        loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
+        return (loss, outputs) if return_outputs else loss
 
 # ---------------------------
 # Data module
@@ -454,7 +456,7 @@ def build_dataset(path: str, text_col: str, label_col: str, seed: int, val_size:
                 test_size=val_size,
                 seed=seed,
             )
-        ds = DatasetDict(train=split["train"], validation=split["test"])
+        ds = DatasetDict({"train": split["train"], "validation": split["test"]})
 
     # Ensure required columns exist
     for col in (text_col, label_col):
