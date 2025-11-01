@@ -134,7 +134,11 @@ ensure_dependencies()
 import numpy as np
 import torch
 from datasets import load_dataset, DatasetDict
-from sklearn.metrics import precision_recall_fscore_support
+try:
+    from sklearn.metrics import precision_recall_fscore_support  # type: ignore
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
 import evaluate
 from transformers import (
     AutoTokenizer,
@@ -153,6 +157,8 @@ from peft import (
     get_peft_model,
     prepare_model_for_kbit_training,
 )
+from huggingface_hub import login as hf_login
+from huggingface_hub.errors import GatedRepoError
 
 # ---------------------------
 # Wordlist utilities
@@ -163,18 +169,39 @@ DEFAULT_CLEANWORDS_URL = "https://raw.githubusercontent.com/first20hours/google-
 
 def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO) -> List[str]:
     bad = []
+    alt_sources = {
+        # Try alternative sources per language if LDNOOBW lacks it
+        "si": [
+            # Add more known sources here if available publicly
+            # Example mirrors or community lists (may or may not exist at runtime)
+            "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master/si",  # original attempt
+            "https://raw.githubusercontent.com/zoomination/multilingual-profanity/main/lists/si.txt",
+            "https://raw.githubusercontent.com/zoomination/multilingual-profanity/master/lists/si.txt",
+        ],
+        "en": [
+            f"{repo_base}/en",
+        ],
+    }
     for lang in langs:
-        url = f"{repo_base}/{lang.strip()}"
-        try:
-            logging.info(f"[wordlist] Downloading bad words for '{lang}' from {url}")
-            with urllib.request.urlopen(url) as r:
-                for line in r.read().decode("utf-8", errors="ignore").splitlines():
-                    w = line.strip()
-                    if not w or w.startswith("#"):
-                        continue
-                    bad.append(w)
-        except Exception as e:
-            logging.warning(f"[wordlist] Failed to download {url}: {e}")
+        tried = False
+        # Primary URL pattern
+        primary_url = f"{repo_base}/{lang.strip()}"
+        for url in [primary_url] + alt_sources.get(lang.strip(), []):
+            if tried and url == primary_url:
+                continue
+            tried = True
+            try:
+                logging.info(f"[wordlist] Downloading bad words for '{lang}' from {url}")
+                with urllib.request.urlopen(url) as r:
+                    for line in r.read().decode("utf-8", errors="ignore").splitlines():
+                        w = line.strip()
+                        if not w or w.startswith("#"):
+                            continue
+                        bad.append(w)
+                break  # success for this lang
+            except Exception as e:
+                logging.warning(f"[wordlist] Failed to download {url}: {e}")
+                continue
     # Deduplicate, keep order
     seen = set()
     uniq = []
@@ -393,6 +420,9 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory.")
     parser.add_argument("--preset", type=str, choices=["base", "low_vram"], default="low_vram", help="Convenience presets for VRAM.")
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
+    # Auth and fallback
+    parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"), help="Hugging Face token for gated models.")
+    parser.add_argument("--fallback_model", type=str, default="Qwen/Qwen2-1.5B-Instruct", help="Fallback open model if base model is gated and no token.")
     args = parser.parse_args()
 
     # Prepare output/logging
@@ -473,10 +503,26 @@ def main():
     # Compute dtype
     compute_dtype = torch.bfloat16 if _bf16_supported() else torch.float16
 
-    # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
+    # Optional HF login for gated models
+    if args.hf_token:
+        try:
+            hf_login(token=args.hf_token)
+            logging.info("Hugging Face login successful via token.")
+        except Exception as e:
+            logging.warning(f"HF login failed: {e}")
+
+    # Tokenizer with gated fallback
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
+        active_model_id = args.base_model
+    except GatedRepoError as ge:
+        logging.warning(f"Base model gated and not accessible: {ge}. Falling back to {args.fallback_model}")
+        tokenizer = AutoTokenizer.from_pretrained(args.fallback_model, use_fast=True)
+        active_model_id = args.fallback_model
+
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token = tokenizer.eos_t_codeoknewe</n
+en
 
     # Dataset
     ds = build_dataset(dataset_path, args.text_column, args.label_column, seed=args.seed, val_size=args.val_size)
@@ -506,7 +552,7 @@ def main():
 
     # Labels/config
     num_labels = int(max(int(max(ds["train"][args.label_column])), int(max(ds["validation"][args.label_column])))) + 1
-    config = AutoConfig.from_pretrained(args.base_model, num_labels=num_labels)
+    config = AutoConfig.from_pretrained(active_model_id, num_labels=num_labels)
 
     # Model loading (GPU QLoRA vs CPU)
     model_kwargs = {"config": config}
@@ -525,11 +571,21 @@ def main():
             )
         )
     else:
-        # CPU path (likely OOM for Gemma). No quantization_config.
+        # CPU path (likely OOM for LLMs). No quantization_config.
         model_kwargs.update(dict(torch_dtype=torch.float32))
 
-    logging.info(f"Loading base model: {args.base_model}")
-    model = AutoModelForSequenceClassification.from_pretrained(args.base_model, **model_kwargs)
+    logging.info(f"Loading base model: {active_model_id}")
+    try:
+        model = AutoModelForSequenceClassification.from_pretrained(active_model_id, **model_kwargs)
+    except GatedRepoError as ge:
+        if active_model_id != args.fallback_model:
+            logging.warning(f"Model gated and not accessible: {ge}. Falling back to {args.fallback_model}")
+            active_model_id = args.fallback_model
+            config = AutoConfig.from_pretrained(active_model_id, num_labels=num_labels)
+            model_kwargs["config"] = config
+            model = AutoModelForSequenceClassification.from_pretrained(active_model_id, **model_kwargs)
+        else:
+            raise
     logging.info(f"Model loaded. Dtype: {getattr(model, 'dtype', 'mixed')}, gradient_checkpointing={args.gradient_checkpointing}")
 
     if args.gradient_checkpointing and has_cuda:
@@ -559,16 +615,24 @@ def main():
 
     # Metrics
     accuracy = evaluate.load("accuracy")
-    f1 = evaluate.load("f1")
+    f1_metric = evaluate.load("f1")
+    precision_metric = evaluate.load("precision")
+    recall_metric = evaluate.load("recall")
 
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
         preds = np.argmax(logits, axis=-1)
         acc = accuracy.compute(predictions=preds, references=labels)["accuracy"]
-        f1_macro = f1.compute(predictions=preds, references=labels, average="macro")["f1"]
-        precision, recall, f1_bin, _ = precision_recall_fscore_support(
-            labels, preds, average="binary", zero_division=0
-        )
+        f1_macro = f1_metric.compute(predictions=preds, references=labels, average="macro")["f1"]
+        if SKLEARN_AVAILABLE:
+            from sklearn.metrics import precision_recall_fscore_support  # local import
+            precision, recall, f1_bin, _ = precision_recall_fscore_support(
+                labels, preds, average="binary", zero_division=0
+            )
+        else:
+            precision = precision_metric.compute(predictions=preds, references=labels, average="binary")["precision"]
+            recall = recall_metric.compute(predictions=preds, references=labels, average="binary")["recall"]
+            f1_bin = f1_metric.compute(predictions=preds, references=labels, average="binary")["f1"]
         return {
             "accuracy": acc,
             "f1_macro": f1_macro,
@@ -640,14 +704,14 @@ def main():
 
     # Export minimal inference card
     card = {
-        "base_model": args.base_model,
+        "base_model": active_model_id,
         "adapter_path": args.output_dir,
         "task": "sequence-classification",
         "labels": list(range(num_labels)),
         "text_column": args.text_column,
         "label_column": args.label_column,
         "max_length": args.max_length,
-        "notes": "Load base Gemma in 4-bit (GPU) and merge with this adapter for bad-word classification.",
+        "notes": "Load base model in 4-bit (GPU) and merge with this adapter for bad-word classification.",
         "train_seconds": round(t1 - t0, 2),
         "preset": args.preset,
     }
