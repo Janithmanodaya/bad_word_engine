@@ -216,7 +216,7 @@ def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO,
     """
     Download bad words for the given language codes.
     - For 'en': use LDNOOBW (try both with/without .txt).
-    - For 'si': STRICT mode — only use URLsirst, then multiple mirrors; if all fail, fall back to a built-in minimal list.
+    - For 'si': STRICT mode — only use URLs provided via si_overrides; if none provided or all fail, raise an error.
     """
     bad: List[str] = []
 
@@ -662,8 +662,7 @@ def main():
     parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub. If hub load fails, fallback to local TSV files.")
     parser.add_argument("--sold_train_path", type=str, default="data/SOLD_train.tsv", help="Local path to SOLD train TSV (fallback).")
     parser.add_argument("--sold_test_path", type=str, default="data/SOLD_test.tsv", help="Local path to SOLD test TSV as validation (fallback).")
-    parser.add_argument("--sold_trial_path", type=str, default="data/SOLD_trial.tsv", help="Local path to SOLD trial TSV (optional, unused for training).new"</)
-")
+    parser.add_argument("--sold_trial_path", type=str, default="data/SOLD_trial.tsv", help="Local path to SOLD trial TSV (optional, unused for training).")
     # Auth and fallback
     parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"), help="Hugging Face token for gated models.")
     parser.add_argument("--fallback_model", type=str, default="Qwen/Qwen2-1.5B-Instruct", help="Fallback open model if base model is gated and no token.")
