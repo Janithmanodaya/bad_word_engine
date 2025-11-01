@@ -131,6 +131,18 @@ def load_si_bad_words_mrmrvl() -> Tuple[Set[str], Set[str]]:
         if si_singlish:
             break
 
+    if not si_unicode:
+        # Minimal Sinhala Unicode seed (extend as needed)
+        si_unicode.update({
+            "උබාදේ", "පකයා", "බඩොන්", "හරපෝ", "කෙවලා",  # placeholder examples
+        })
+        logger.warning("MRVLS unicode fetch failed; using built-in Sinhala unicode seed list (%d words).", len(si_unicode))
+    if not si_singlish:
+        si_singlish.update({
+            "pakaya", "kariya", "harak", "baduwa", "kapanna",  # placeholder examples
+        })
+        logger.warning("MRVLS singlish fetch failed; using built-in Sinhala singlish seed list (%d words).", len(si_singlish))
+
     logger.info("Loaded Sinhala MRVLS: unicode=%d singlish=%d", len(si_unicode), len(si_singlish))
     return si_unicode, si_singlish
 
