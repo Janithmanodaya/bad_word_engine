@@ -150,6 +150,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
     set_seed,
+    TrainerCallback,
 )
 from transformers.utils import logging as hf_logging
 from transformers.trainer_utils import get_last_checkpoint
@@ -430,6 +431,32 @@ class WeightedTrainer(Trainer):
         loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
 
+
+# ---------------------------
+# Callback to delay evaluation
+# ---------------------------
+
+class DelayedEvalCallback(TrainerCallback):
+    def __init__(self, start_step: int = 0, start_epoch: float = 0.0):
+        self.start_step = int(start_step or 0)
+        self.start_epoch = float(start_epoch or 0.0)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        try:
+            if state.global_step is not None and state.global_step < self.start_step:
+                control.should_evaluate = False
+        except Exception:
+            pass
+        return control
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        try:
+            if state.epoch is not None and state.epoch < self.start_epoch:
+                control.should_evaluate = False
+        except Exception:
+            pass
+        return control
+
 # ---------------------------
 # Data module
 # ---------------------------
@@ -550,7 +577,7 @@ def main():
     parser.add_argument("--push_to_hub", action="store_true")
     parser.add_argument("--hub_model_id", type=str, default=None)
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory.")
-    parser.add_argument("--preset", type=str, choices=["base", "low_vram"], default="low_vram", help="Convenience presets for VRAM.")
+    parser.add_argument("--preset", type=str, choices=["base", "low_vram", "t4_fast"], default="low_vram", help="Convenience presets for VRAM.")
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
     # GPU preference/validation
     parser.add_argument("--require_gpu_name", type=str, default="", help="If set, require that CUDA device name contains this substring (e.g., 'T4').")
@@ -560,6 +587,9 @@ def main():
     # Resume options
     parser.add_argument("--resume", action="store_true", help="Auto-resume from the last checkpoint found in output_dir if available.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint to resume from. If set, overrides --resume.")
+    # Evaluation delay options
+    parser.add_argument("--eval_start_step", type=int, default=0, help="Skip evaluation until this global step is reached.")
+    parser.add_argument("--eval_start_epoch", type=float, default=0.0, help="Skip evaluation until this epoch number is reached.")
     # Use SOLD dataset
     parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub instead of local file/auto wordlists.")
     # Auth and fallback
@@ -637,6 +667,22 @@ def main():
         args.eval_steps = max(args.eval_steps, 100)
         args.save_steps = max(args.save_steps, 1000)
         # Slightly lower LR can stabilize with high accumulation
+        args.learning_rate = min(args.learning_rate, 2e-4)
+    if args.preset == "t4_fast":
+        # A faster preset tuned for T4 on Colab: shorter sequences, less checkpoint/eval overhead,
+        # and reduced accumulation to progress steps faster (may use a bit more VRAM).
+        args.per_device_train_batch_size = 1
+        args.per_device_eval_batch_size = 1
+        args.max_length = min(args.max_length, 64)
+        # Reduce accumulation to progress global steps faster
+        args.gradient_accumulation_steps = max(8, int(args.gradient_accumulation_steps or 8))
+        # Disable gradient checkpointing for speed (T4 16GB should handle 2B 4-bit + LoRA at seq 64)
+        args.gradient_checkpointing = False
+        # Make logging/eval/save less frequent to reduce overhead
+        args.logging_steps = max(args.logging_steps, 50)
+        args.eval_steps = max(args.eval_steps, 500)
+        args.save_steps = max(args.save_steps, 2000)
+        # Keep LR as specified or capped
         args.learning_rate = min(args.learning_rate, 2e-4)
 
     # Build dataset from wordlists if requested (skip when using SOLD)
@@ -937,6 +983,15 @@ def main():
             )
         )
 
+    # Prefer fused AdamW if available for speed
+    try:
+        _params = inspect.signature(TrainingArguments.__init__).parameters
+        if "optim" in _params:
+            training_kwargs["optim"] = "adamw_torch"
+            logging.info("Using optim='adamw_torch' for potential fused speedups.")
+    except Exception:
+        pass
+
     train_args = TrainingArguments(**training_kwargs)
 
     trainer = WeightedTrainer(
@@ -949,6 +1004,12 @@ def main():
         data_collator=collator,
         compute_metrics=compute_metrics,
     )
+
+    # Register evaluation delay callback if requested
+    if (args.eval_start_step and args.eval_start_step > 0) or (args.eval_start_epoch and args.eval_start_epoch > 0.0):
+        trainer.add_callback(DelayedEvalCallback(start_step=args.eval_start_step, start_epoch=args.eval_start_epoch))
+        logging.info("[eval] Evaluation will be skipped until step >= %s and epoch >= %s", args.eval_start_step, args.eval_start_ep_codeocnewh</)
+
 
     # Train
     logging.info("=" * 70)
