@@ -521,6 +521,7 @@ def main():
         active_model_id = args.fallback_model
 
     if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_tokenkenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_t_codeoknewe</n
 en
 
