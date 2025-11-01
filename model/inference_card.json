@@ -1,0 +1,24 @@
+{
+  "model": "scikit-learn LinearSVC (or LogisticRegression) + TF-IDF char/word n-grams",
+  "model_path": "outputs/badwords-ml",
+  "task": "badword-detection-binary",
+  "text_column": "text",
+  "label_column": "label",
+  "char_ngrams": [
+    2,
+    5
+  ],
+  "word_ngrams": [
+    1,
+    2
+  ],
+  "notes": "Compact ML model for bad-word detection. No LLM/Transformers used.",
+  "metrics": {
+    "accuracy": 0.8124,
+    "precision_bin": 0.7752016129032258,
+    "recall_bin": 0.7576354679802956,
+    "f1_bin": 0.7663178873941205,
+    "f1_macro": 0.804809461572102,
+    "train_seconds": 0.74
+  }
+}
