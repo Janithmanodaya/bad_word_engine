@@ -578,7 +578,7 @@ def main():
     parser.add_argument("--push_to_hub", action="store_true")
     parser.add_argument("--hub_model_id", type=str, default=None)
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory.")
-    parser.add_argument("--preset", type=str, choices=["base", "low_vram", "t4_fast"], default="low_vram", help="Convenience presets for VRAM.")
+    parser.add_argument("--preset", type=str, choices=["base", "low_vram", "t4_fast", "small_cls"], default="low_vram", help="Convenience presets for VRAM or small classifier.")
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
     # GPU preference/validation
     parser.add_argument("--require_gpu_name", type=str, default="", help="If set, require that CUDA device name contains this substring (e.g., 'T4').")
@@ -657,6 +657,13 @@ def main():
     logging.info("Starting Gemma bad-words training")
     logging.info(f"Args: {vars(args)}")
 
+    # Decide if we are using a small classifier model (no LoRA/4-bit)
+    SMALL_MODEL_IDS = {
+        "microsoft/Multilingual-MiniLM-L12-H384",
+        "prajjwal1/bert-tiny",
+    }
+    small_model = (args.preset == "small_cls") or (args.base_model in SMALL_MODEL_IDS)
+
     # ---------------------------
     # Colab keepalive thread
     # ---------------------------
@@ -714,6 +721,19 @@ def main():
         args.save_steps = max(args.save_steps, 2000)
         # Keep LR as specified or capped
         args.learning_rate = min(args.learning_rate, 2e-4)
+    if args.preset == "small_cls":
+        # Small classifier preset (no LoRA/4-bit quantization). Good for multilingual toxicity.
+        if args.base_model == "google/gemma-2-2b-it":
+            args.base_model = "microsoft/Multilingual-MiniLM-L12-H384"
+        args.per_device_train_batch_size = max(8, int(args.per_device_train_batch_size or 8))
+        args.per_device_eval_batch_size = max(32, int(args.per_device_eval_batch_size or 32))
+        args.max_length = min(args.max_length, 64)
+        args.gradient_accumulation_steps = max(1, int(args.gradient_accumulation_steps or 1))
+        args.gradient_checkpointing = False
+        args.logging_steps = max(args.logging_steps, 20)
+        args.eval_steps = max(args.eval_steps, 200)
+        args.save_steps = max(args.save_steps, 1000)
+        args.learning_rate = min(args.learning_rate, 5e-4)
 
     # Build dataset from wordlists if requested (skip when using SOLD)
     dataset_path = args.dataset_path
@@ -859,25 +879,32 @@ def main():
 
     # Model loading (GPU QLoRA vs CPU)
     model_kwargs = {"config": config}
-    if has_cuda:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=compute_dtype,
-        )
-        # Prefer binding entirely to GPU 0 when available
-        device_map = {"": 0} if torch.cuda.device_count() >= 1 else "auto"
-        model_kwargs.update(
-            dict(
-                quantization_config=bnb_config,
-                torch_dtype=compute_dtype,
-                device_map=device_map,
-            )
-        )
+    if small_model:
+        # No 4-bit quantization or PEFT for small classifier models
+        if has_cuda:
+            model_kwargs.update(dict(torch_dtype=compute_dtype, device_map={"": 0} if torch.cuda.device_count() >= 1 else "auto"))
+        else:
+            model_kwargs.update(dict(torch_dtype=torch.float32))
     else:
-        # CPU path (likely OOM for LLMs). No quantization_config.
-        model_kwargs.update(dict(torch_dtype=torch.float32))
+        if has_cuda:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+            # Prefer binding entirely to GPU 0 when available
+            device_map = {"": 0} if torch.cuda.device_count() >= 1 else "auto"
+            model_kwargs.update(
+                dict(
+                    quantization_config=bnb_config,
+                    torch_dtype=compute_dtype,
+                    device_map=device_map,
+                )
+            )
+        else:
+            # CPU path (likely OOM for LLMs). No quantization_config.
+            model_kwargs.update(dict(torch_dtype=torch.float32))
 
     logging.info(f"Loading base model: {active_model_id}")
     try:
@@ -895,7 +922,7 @@ def main():
             raise
     logging.info(f"Model loaded. Dtype: {getattr(model, 'dtype', 'mixed')}, gradient_checkpointing={args.gradient_checkpointing}")
 
-    if args.gradient_checkpointing and has_cuda:
+    if args.gradient_checkpointing and has_cuda and not small_model:
         # Prefer non-reentrant checkpointing to avoid future torch warning
         try:
             # Newer transformers accept kwargs dict
@@ -911,24 +938,27 @@ def main():
                 model.gradient_checkpointing_enable()
                 logging.info("Enabled gradient checkpointing with default settings (use_reentrant default).")
 
-    # Prepare for k-bit training and apply LoRA (GPU only)
-    if has_cuda:
+    # Prepare for k-bit training and apply LoRA (GPU only, LLM path)
+    if has_cuda and not small_model:
         model = prepare_model_for_kbit_training(model)
 
-    # Typical Llama/Gemma target modules
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    if not small_model:
+        # Typical Llama/Gemma target modules
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
-    lora_cfg = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=target_modules,
-        bias="none",
-        task_type=TaskType.SEQ_CLS,
-    )
-    logging.info(f"LoRA config: r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, targets={target_modules}")
+        lora_cfg = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type=TaskType.SEQ_CLS,
+        )
+        logging.info(f"LoRA config: r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, targets={target_modules}")
 
-    model = get_peft_model(model, lora_cfg)
+        model = get_peft_model(model, lora_cfg)
+    else:
+        logging.info("Small classifier preset active: training full model head without LoRA or 4-bit quantization.")
 
     # Class weights from training labels
     class_weights = compute_class_weights(list(ds["train"][args.label_column]))
