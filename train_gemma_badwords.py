@@ -36,6 +36,7 @@ from typing import Optional, List
 import shutil
 import time
 import logging
+from collections import defaultdict
 
 # ---------------------------
 # Colab detection
@@ -167,6 +168,37 @@ from huggingface_hub.errors import GatedRepoError
 DEFAULT_BADWORDS_REPO = "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master"
 DEFAULT_CLEANWORDS_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt"
 
+# Simple download event log for clear PASS/FAIL reporting
+DOWNLOAD_EVENTS: List[dict] = []
+
+def _record_download(stage: str, url: str, ok: bool, count: int = 0, error: str = "") -> None:
+    DOWNLOAD_EVENTS.append({
+        "stage": stage,
+        "url": url,
+        "ok": bool(ok),
+        "count": int(count) if count else 0,
+        "error": error,
+    })
+
+def _summarize_downloads() -> None:
+    if not DOWNLOAD_EVENTS:
+        return
+    logging.info("=" * 70)
+    logging.info("Download summary (PASS/FAIL):")
+    by_stage: dict = defaultdict(list)
+    for ev in DOWNLOAD_EVENTS:
+        by_stage[ev["stage"]].append(ev)
+    for stage in sorted(by_stage.keys()):
+        stage_events = by_stage[stage]
+        ok_n = sum(1 for e in stage_events if e["ok"])
+        fail_n = sum(1 for e in stage_events if not e["ok"])
+        logging.info(f"- {stage}: {ok_n} OK, {fail_n} FAIL")
+        for e in stage_events:
+            status = "OK" if e["ok"] else "FAIL"
+            extra = f" (lines={e['count']})" if e["ok"] else f" (error={e['error']})"
+            logging.info(f"  [{status}] {e['url']}{extra}")
+    logging.info("=" * 70)
+
 def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO) -> List[str]:
     """
     Download bad words for the given language codes.
@@ -175,15 +207,18 @@ def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO)
     """
     bad: List[str] = []
 
-    def _fetch_lines(url: str) -> List[str]:
+    def _fetch_lines(stage: str, url: str) -> List[str]:
         try:
             with urllib.request.urlopen(url) as r:
-                return [
+                lines = [
                     line.strip()
                     for line in r.read().decode("utf-8", errors="ignore").splitlines()
                     if line.strip() and not line.strip().startswith("#")
                 ]
+                _record_download(stage, url, ok=True, count=len(lines))
+                return lines
         except Exception as e:
+            _record_download(stage, url, ok=False, error=str(e))
             logging.warning(f"[wordlist] Failed to download {url}: {e}")
             return []
 
@@ -204,7 +239,7 @@ def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO)
             ]
             got_any = False
             for u in candidates:
-                lines = _fetch_lines(u)
+                lines = _fetch_lines("badwords:si", u)
                 if lines:
                     bad.extend(lines)
                     got_any = True
@@ -229,7 +264,7 @@ def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO)
             ]
 
         for url in candidates:
-            lines = _fetch_lines(url)
+            lines = _fetch_lines(f"badwords:{lang}", url)
             if lines:
                 bad.extend(lines)
                 break
@@ -250,13 +285,16 @@ def download_clean_words(url: str = DEFAULT_CLEANWORDS_URL, limit: int = 10000) 
     try:
         logging.info(f"[wordlist] Downloading clean words from {url}")
         with urllib.request.urlopen(url) as r:
-            for i, line in enumerate(r.read().decode("utf-8", errors="ignore").splitlines()):
+            lines = r.read().decode("utf-8", errors="ignore").splitlines()
+            _record_download("cleanwords", url, ok=True, count=len(lines))
+            for i, line in enumerate(lines):
                 if not line:
                     continue
                 clean.append(line.strip().lower())
                 if limit and len(clean) >= limit:
                     break
     except Exception as e:
+        _record_download("cleanwords", url, ok=False, error=str(e))
         logging.warning(f"[wordlist] Failed to download clean words: {e}")
     logging.info(f"[wordlist] Total clean words collected: {len(clean)}")
     return clean
