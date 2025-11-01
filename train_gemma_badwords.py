@@ -916,7 +916,7 @@ def main():
         args.label_column = "label"
         logging.info("[SOLD] Using columns text='%s', label='%s'", args.text_column, args.label_column)
     else:
-       )
+        ds = build_dataset(dataset_path, args.text_column, args.label_column, seed=args.seed, val_size=args.val_size)
     ds = ensure_label_ints(ds, args.label_column)
     # Log dataset stats
     try:
