@@ -436,6 +436,9 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory.")
     parser.add_argument("--preset", type=str, choices=["base", "low_vram"], default="low_vram", help="Convenience presets for VRAM.")
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
+    # GPU preference/validation
+    parser.add_argument("--require_gpu_name", type=str, default="", help="If set, require that CUDA device name contains this substring (e.g., 'T4').")
+    parser.add_argument("--enforce_gpu_name", action="store_true", help="If true and require_gpu_name set, exit if the CUDA device name doesn't match.")
     # Auth and fallback
     parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"), help="Hugging Face token for gated models.")
     parser.add_argument("--fallback_model", type=str, default="Qwen/Qwen2-1.5B-Instruct", help="Fallback open model if base model is gated and no token.")
@@ -504,11 +507,31 @@ def main():
     logging.info(f"CUDA available: {has_cuda}")
     if has_cuda:
         try:
-            logging.info(f"CUDA device count: {torch.cuda.device_count()}")
-            logging.info(f"CUDA device: {torch.cuda.get_device_name(0)}")
-        except Exception:
-            pass
+            ndev = torch.cuda.device_count()
+            torch.cuda.set_device(0)
+            dev_name = torch.cuda.get_device_name(0)
+            logging.info(f"CUDA device count: {ndev}")
+            logging.info(f"Using CUDA device 0: {dev_name}")
+            # Enforce/validate GPU name if requested
+            if args.require_gpu_name:
+                if args.require_gpu_name.lower() not in dev_name.lower():
+                    msg = f"Detected GPU '{dev_name}' does not match required pattern '{args.require_gpu_name}'."
+                    if args.enforce_gpu_name:
+                        raise SystemExit(msg + " Exiting due to --enforce_gpu_name.")
+                    else:
+                        logging.warning(msg + " Continuing anyway.")
+            else:
+                # In Colab, hint if not a T4
+                if in_colab() and "t4" not in dev_name.lower():
+                    logging.warning("Colab GPU is '%s', not T4. If you require T4, set --require_gpu_name T4.", dev_name)
+        except Exception as e:
+            logging.warning(f"Failed to finalize CUDA device selection/logging: {e}")
     if not has_cuda and not args.force_cpu:
+        if in_colab():
+            raise SystemExit(
+                "No CUDA GPU detected. In Google Colab, enable GPU via: Runtime > Change runtime type > Hardware accelerator > GPU.\n"
+                "If you still want to attempt CPU training (not recommended; may OOM), pass --force_cpu."
+            )
         raise SystemExit(
             "No CUDA GPU detected. QLoRA with bitsandbytes requires an NVIDIA GPU. "
             "If you still want to attempt CPU training (not recommended; may OOM), pass --force_cpu."
@@ -598,11 +621,13 @@ def main():
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=compute_dtype,
         )
+        # Prefer binding entirely to GPU 0 when available
+        device_map = {"": 0} if torch.cuda.device_count() >= 1 else "auto"
         model_kwargs.update(
             dict(
                 quantization_config=bnb_config,
                 torch_dtype=compute_dtype,
-                device_map="auto",
+                device_map=device_map,
             )
         )
     else:
