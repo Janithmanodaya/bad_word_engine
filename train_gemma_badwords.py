@@ -814,7 +814,20 @@ def main():
     logging.info(f"Model loaded. Dtype: {getattr(model, 'dtype', 'mixed')}, gradient_checkpointing={args.gradient_checkpointing}")
 
     if args.gradient_checkpointing and has_cuda:
-        model.gradient_checkpointing_enable()
+        # Prefer non-reentrant checkpointing to avoid future torch warning
+        try:
+            # Newer transformers accept kwargs dict
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            logging.info("Enabled gradient checkpointing with use_reentrant=False via kwargs dict.")
+        except TypeError:
+            try:
+                # Some versions accept use_reentrant kw directly
+                model.gradient_checkpointing_enable(use_reentrant=False)
+                logging.info("Enabled gradient checkpointing with use_reentrant=False (direct kw).")
+            except Exception:
+                # Fallback to default behavior if signature doesn't support the flag
+                model.gradient_checkpointing_enable()
+                logging.info("Enabled gradient checkpointing with default settings (use_reentrant default).")
 
     # Prepare for k-bit training and apply LoRA (GPU only)
     if has_cuda:
@@ -902,6 +915,19 @@ def main():
     if eval_key:
         training_kwargs[eval_key] = "steps"
     training_kwargs["eval_steps"] = args.eval_steps
+
+    # If TrainingArguments supports gradient_checkpointing_kwargs, pass use_reentrant=False
+    try:
+        _params = inspect.signature(TrainingArguments.__init__).parameters
+        if "gradient_checkpointing_kwargs" in _params and args.gradient_checkpointing:
+            training_kwargs["gradient_checkpointing"] = True
+            training_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+            logging.info("TrainingArguments configured with gradient_checkpointing_kwargs={'use_reentrant': False}.")
+        else:
+            # Maintain user preference if flag set but kwargs not supported
+            training_kwargs["gradient_checkpointing"] = bool(args.gradient_checkpointing)
+    except Exception:
+        training_kwargs["gradient_checkpointing"] = bool(args.gradient_checkpointing)
 
     if has_cuda:
         training_kwargs.update(
