@@ -402,7 +402,9 @@ class WeightedTrainer(Trainer):
         super().__init__(**kwargs)
         self.class_weights = class_weights
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    # Accept **kwargs to be compatible with Transformers v5 which passes
+    # num_items_in_batch into compute_loss.
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.logits
@@ -411,9 +413,7 @@ class WeightedTrainer(Trainer):
             weights = self.class_weights.to(device)
             loss_fct = torch.nn.CrossEntropyLoss(weight=weights)
         else:
-            loss_fct = torch.nn.CrossEntropyLoss()
-        loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
-        return (loss, outputs) if return_outputs else loss
+            loss_fct = torch.nn.Crossrn_outputs else loss
 
 # ---------------------------
 # Data module
