@@ -98,6 +98,29 @@ SINHALA_STOPWORDS: Set[str] = {
     "ඉතින්",
 }
 
+# Sinhala suffixes for common inflections/plurals to catch variants
+SI_SUFFIXES: Set[str] = {
+    "යා", "යෝ", "යො", "යෙක්", "ට", "ටා", "ටෙක්", "ක", "නේ", "ටු", "ටෝ",
+    "ටො", "ටය", "ය", "යි", "ගේ", "ව", "වට", "වමු", "වෝ", "වො",
+}
+
+# Built-in Sinhala bad word lemmas (minimal curated set)
+DEFAULT_SI_BAD_WORDS: Set[str] = {
+    "මෝඩ",     # fool / stupid
+    "පොන්න",   # insult
+    "හමඩ",     # coarse insult variant
+    "මලා",     # can be insult in context (keep minimal)
+    "හරක්",    # donkey (insult)
+    "ගැනි",    # coarse
+}
+
+# Built-in Singlish bad words (minimal curated)
+DEFAULT_SINGLISH_BAD_WORDS: Set[str] = {
+    "moda", "modayo", "modaya",
+    "ponnaya", "ponnayo",
+    "harak", "booruwa",
+}
+
 # Aho-corasick automatons (optional)
 AC_AUTOMATON_EN = None
 AC_AUTOMATON_SI = None
@@ -496,8 +519,8 @@ def init_lexicons() -> None:
     topn = int(os.getenv("SEMISOLD_TOP_TOKENS", "1000"))
     si_semisold = _load_semisold_tokens(threshold=thr, top_tokens=topn)
 
-    # Build Sinhala set and apply stopword filter
-    BAD_WORDS_SI = set()
+    # Build Sinhala set and apply stopword filter, include built-in defaults
+    BAD_WORDS_SI = set(DEFAULT_SI_BAD_WORDS)
     for w in si_unicode_mrmrvl.union(si_sold).union(si_semisold):
         w_norm = unicodedata.normalize("NFKC", w)
         if len(w_norm) < 3:
@@ -506,8 +529,8 @@ def init_lexicons() -> None:
             continue
         BAD_WORDS_SI.add(w_norm)
 
-    # Singlish set (lowercased)
-    BAD_WORDS_SI_SINGLISH = set()
+    # Singlish set (lowercased) include built-in defaults
+    BAD_WORDS_SI_SINGLISH = set(x.lower() for x in DEFAULT_SINGLISH_BAD_WORDS)
     for w in si_singlish_mrmrvl:
         w_l = w.lower().strip()
         if len(w_l) < 2:
@@ -525,9 +548,10 @@ def init_lexicons() -> None:
     if HAS_AHO:
         try:
             AC_AUTOMATON_EN = build_automaton(BAD_WORDS_EN)
-            AC_AUTOMATON_SI = build_automaton(BAD_WORDS_SI)
+            # Avoid Sinhala substring automaton to reduce false positives; keep Singlish
+            AC_AUTOMATON_SI = None
             AC_AUTOMATON_SI_SING = build_automaton(BAD_WORDS_SI_SINGLISH)
-            logger.info("Aho-Corasick automatons built (enabled)")
+            logger.info("Aho-Corasick automatons built (enabled for EN/Singlish)")
         except Exception as e:
             logger.warning("Failed to build Aho automatons: %s", e)
     else:
