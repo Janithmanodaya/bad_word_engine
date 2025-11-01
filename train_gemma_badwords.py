@@ -32,7 +32,7 @@ import sys
 import subprocess
 import importlib.util
 import urllib.request
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import shutil
 import time
 import logging
@@ -621,13 +621,13 @@ def build_sold_dataset(
         logging.info("[SOLD] Local TSV dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
 
     # Normalize columns to 'text' and 'label' if needed
-    def _guess_columns(column_names: List[str]) -> (str, str):
+    def _guess_columns(column_names: List[str]) -> Tuple[str, str]:
         text_candidates = ["text", "comment", "sentence", "content"]
         label_candidates = ["label", "labels", "gold_label", "class", "target"]
         text_col = next((c for c in text_candidates if c in column_names), None)
         label_col = next((c for c in label_candidates if c in column_names), None)
         if not text_col or not label_col:
-            raise ValueError(f"[SOLD] Could not infer text/label columns from: {column_names}")
+            raise ValueError(f"[SOLD] Could not infer textl columns from: {column_names}")
         return text_col, label_col
 
     tcol_train, lcol_train = _guess_columns(ds["train"].column_names)
