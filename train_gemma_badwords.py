@@ -38,6 +38,17 @@ import time
 import logging
 
 # ---------------------------
+# Colab detection
+# ---------------------------
+
+def in_colab() -> bool:
+    try:
+        import google.colab  # type: ignore
+        return True
+    except Exception:
+        return False
+
+# ---------------------------
 # Bootstrap: ensure dependencies installed
 # ---------------------------
 
@@ -80,8 +91,9 @@ def _install_torch_best_effort():
             print(f"[setup] WARNING: torch CPU install also failed: {e2}. Continuing; training may not work.")
 
 def ensure_dependencies():
-    # Torch first (chooses CUDA wheel if possible)
-    _install_torch_best_effort()
+    # Prefer not to disturb Colab's preinstalled CUDA/torch stack
+    if not in_colab():
+        _install_torch_best_effort()
 
     missing = []
     # Map import names for some pkgs
@@ -101,6 +113,15 @@ def ensure_dependencies():
                 _pip_install([spec])
             except subprocess.CalledProcessError as e:
                 print(f"[setup] WARNING: Failed to install {spec}: {e}")
+
+    # Optional: install git-lfs on Colab to accelerate model downloads
+    if in_colab():
+        try:
+            if shutil.which("git-lfs") is None:
+                subprocess.check_call(["apt-get", "update", "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.check_call(["apt-get", "install", "-y", "git-lfs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[setup] WARNING: git-lfs install failed or unnecessary: {e}")
 
     # Final check logging
     for spec in REQUIRED_PKGS + ["torch"]:
@@ -376,6 +397,17 @@ def main():
 
     # Prepare output/logging
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Colab-specific cache optimization
+    if in_colab():
+        os.environ.setdefault("HF_HOME", "/content/cache/hf")
+        os.environ.setdefault("TRANSFORMERS_CACHE", "/content/cache/transformers")
+        os.environ.setdefault("DATASETS_CACHE", "/content/cache/datasets")
+        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        os.makedirs(os.environ["HF_HOME"], exist_ok=True)
+        os.makedirs(os.environ["TRANSFORMERS_CACHE"], exist_ok=True)
+        os.makedirs(os.environ["DATASETS_CACHE"], exist_ok=True)
+
     log_path = os.path.join(args.output_dir, "train.log")
     logging.basicConfig(
         level=logging.INFO,
@@ -390,7 +422,7 @@ def main():
     logging.info(f"Args: {vars(args)}")
 
     # Apply presets
-    if args.preset == "low_vram":
+    if args.preset == "low_vram" or in_colab():
         # Lower memory footprint settings
         if not args.gradient_accumulation_steps or args.gradient_accumulation_steps < 16:
             args.gradient_accumulation_steps = 16
@@ -398,6 +430,10 @@ def main():
         args.per_device_eval_batch_size = 1
         args.max_length = min(args.max_length, 128)
         args.gradient_checkpointing = True
+        # Logging/eval cadence better for Colab
+        args.logging_steps = min(args.logging_steps, 5)
+        args.eval_steps = max(args.eval_steps, 100)
+        args.save_steps = max(args.save_steps, 1000)
         # Slightly lower LR can stabilize with high accumulation
         args.learning_rate = min(args.learning_rate, 2e-4)
 
