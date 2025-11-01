@@ -362,13 +362,25 @@ def ensure_label_ints(dataset: DatasetDict, label_column: str) -> DatasetDict:
         mapping = {"clean": 0, "bad": 1}
     elif lowered <= {"safe", "toxic"}:
         mapping = {"safe": 0, "toxic": 1}
+    elif lowered <= {"offensive", "not-offensive"}:
+        mapping = {"not-offensive": 0, "offensive": 1}
+    elif lowered <= {"off", "not"}:
+        mapping = {"not": 0, "off": 1}
     else:
         # Build alphabetical mapping deterministically
-        mapping = {val: i for i, val in enumerate(sorted(unique))}
+        mapping = {str(val).lower(): i for i, val in enumerate(sorted(lowered))}
 
     def map_labels(example):
         v = example[label_column]
-        example[label_column] = mapping[str(v).lower()] if str(v).lower() in mapping else mapping.get(v, int(v))
+        key = str(v).lower()
+        if key in mapping:
+            example[label_column] = mapping[key]
+        else:
+            try:
+                example[label_column] = int(v)
+            except Exception:
+                # Fallback: unseen label defaults to 0
+                example[label_column] = 0
         return example
 
     return dataset.map(map_labels)
@@ -409,11 +421,13 @@ class WeightedTrainer(Trainer):
         outputs = model(**inputs)
         logits = outputs.logits
         if self.class_weights is not None:
-            device = logits.device
-            weights = self.class_weights.to(device)
+            weights = self.class_weights.to(logits.device)
             loss_fct = torch.nn.CrossEntropyLoss(weight=weights)
         else:
-            loss_fct = torch.nn.Crossrn_outputs else loss
+            loss_fct = torch.nn.CrossEntropyLoss()
+        # Flatten in case of batched inputs
+        loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
+        return (loss, outputs) if return_outputs else loss
 
 # ---------------------------
 # Data module
@@ -454,13 +468,44 @@ def build_dataset(path: str, text_col: str, label_col: str, seed: int, val_size:
                 test_size=val_size,
                 seed=seed,
             )
-        ds = DatasetDict(train=split["train"], validation=split["test"])
+        ds = DatasetDict({"train": split["train"], "validation": split["test"]})
 
     # Ensure required columns exist
     for col in (text_col, label_col):
         if col not in ds["train"].column_names:
             raise ValueError(f"Column '{col}' not found in dataset. Available: {ds['train'].column_names}")
 
+    return ds
+
+
+def build_sold_dataset(seed: int, val_size: float) -> DatasetDict:
+    """
+    Load SOLD (Sinhala Offensive Language Dataset) from Hugging Face and return a DatasetDict
+    with 'train' and 'validation' splits. Columns used: text (features) and label (targets).
+    """
+    logging.info("[SOLD] Loading 'sinhala-nlp/SOLD' from Hugging Face hub")
+    raw = load_dataset("sinhala-nlp/SOLD")
+    # Prefer official train/test; fall back to creating a split if necessary
+    if isinstance(raw, dict):
+        if "train" in raw and "test" in raw:
+            ds = DatasetDict({"train": raw["train"], "validation": raw["test"]})
+        elif "train" in raw and "validation" in raw:
+            ds = DatasetDict({"train": raw["train"], "validation": raw["validation"]})
+        else:
+            # Single split present; create validation
+            base = list(raw.values())[0]
+            split = base.train_test_split(test_size=val_size, seed=seed)
+            ds = DatasetDict({"train": split["train"], "validation": split["test"]})
+    else:
+        # Unexpected structure; make a split
+        split = raw.train_test_split(test_size=val_size, seed=seed)
+        ds = DatasetDict({"train": split["train"], "validation": split["test"]})
+
+    # Confirm columns exist
+    for col in ("text", "label"):
+        if col not in ds["train"].column_names:
+            raise ValueError(f"[SOLD] Column '{col}' not found. Available: {ds['train'].column_names}")
+    logging.info("[SOLD] Dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
     return ds
 
 # ---------------------------
@@ -511,6 +556,8 @@ def main():
     parser.add_argument("--enforce_gpu_name", action="store_true", help="If true and require_gpu_name set, exit if the CUDA device name doesn't match.")
     # Fresh start / cache clearing
     parser.add_argument("--fresh_start", action="store_true", help="Delete output_dir and model/dataset caches before starting.")
+    # Use SOLD dataset
+    parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub instead of local file/auto wordlists.")
     # Auth and fallback
     parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"), help="Hugging Face token for gated models.")
     parser.add_argument("--fallback_model", type=str, default="Qwen/Qwen2-1.5B-Instruct", help="Fallback open model if base model is gated and no token.")
@@ -588,20 +635,23 @@ def main():
         # Slightly lower LR can stabilize with high accumulation
         args.learning_rate = min(args.learning_rate, 2e-4)
 
-    # Build dataset from wordlists if requested
+    # Build dataset from wordlists if requested (skip when using SOLD)
     dataset_path = args.dataset_path
-    if args.auto_wordlists and (args.regenerate_wordlist or not os.path.exists(dataset_path)):
-        langs = [s.strip() for s in args.bad_words_langs.split(",") if s.strip()]
-        bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url)
-        clean_words = download_clean_words(url=args.clean_words_url, limit=args.wordlist_clean_limit)
-        if not bad_words:
-            logging.warning("[wordlist] No bad words downloaded; training may not be meaningful.")
-        if not clean_words:
-            logging.warning("[wordlist] No clean words downloaded; training may not be meaningful.")
-        build_wordlist_dataset_csv(dataset_path, bad_words, clean_words, augment_context=args.augment_context)
+    if not args.use_sold:
+        if args.auto_wordlists and (args.regenerate_wordlist or not os.path.exists(dataset_path)):
+            langs = [s.strip() for s in args.bad_words_langs.split(",") if s.strip()]
+            bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url)
+            clean_words = download_clean_words(url=args.clean_words_url, limit=args.wordlist_clean_limit)
+            if not bad_words:
+                logging.warning("[wordlist] No bad words downloaded; training may not be meaningful.")
+            if not clean_words:
+                logging.warning("[wordlist] No clean words downloaded; training may not be meaningful.")
+            build_wordlist_dataset_csv(dataset_path, bad_words, clean_words, augment_context=args.augment_context)
+            # Summarize download results for clear verification in logs
+            _summarize_downloads()
 
-    # Dataset presence or download otherwise
-    dataset_path = maybe_download_dataset(dataset_path, args.dataset_url)
+        # Dataset presence or download otherwise
+        dataset_path = maybe_download_dataset(dataset_path, args.dataset_url)
 
     # Environment checks
     has_cuda = torch.cuda.is_available()
@@ -670,7 +720,14 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # Dataset
-    ds = build_dataset(dataset_path, args.text_column, args.label_column, seed=args.seed, val_size=args.val_size)
+    if args.use_sold:
+        ds = build_sold_dataset(seed=args.seed, val_size=args.val_size)
+        # SOLD uses text/label columns by definition
+        args.text_column = "text"
+        args.label_column = "label"
+        logging.info("[SOLD] Using columns text='%s', label='%s'", args.text_column, args.label_column)
+    else:
+        ds = build_dataset(dataset_path, args.text_column, args.label_column, seed=args.seed, val_size=args.val_size)
     ds = ensure_label_ints(ds, args.label_column)
     # Log dataset stats
     try:
@@ -864,6 +921,25 @@ def main():
     )
 
     # Train
+    logging.info("=" * 70)
+    logging.info("DATASET SUMMARY BEFORE TRAINING")
+    if args.use_sold:
+        logging.info("[SOLD] Source: HuggingFace hub 'sinhala-nlp/SOLD' (downloaded via datasets)")
+    else:
+        logging.info("[DATA] Source: local file '%s'%s",
+                     dataset_path,
+                     " (downloaded from URL)" if args.dataset_url else "")
+    logging.info("[DATA] Train size: %d, Validation size: %d", len(ds["train"]), len(ds["validation"]))
+    try:
+        import collections as _collections
+        _cnt_train = _collections.Counter(ds["train"][args.label_column])
+        _cnt_val = _collections.Counter(ds["validation"][args.label_column])
+        logging.info("[DATA] Label distribution (train): %s", dict(_cnt_train))
+        logging.info("[DATA] Label distribution (validation): %s", dict(_cnt_val))
+    except Exception as _e:
+        logging.warning("[DATA] Failed to compute label distribution: %s", _e)
+    logging.info("=" * 70)
+
     logging.info("Beginning training...")
     t0 = time.time()
     train_result = trainer.train()
