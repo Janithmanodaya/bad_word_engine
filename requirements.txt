@@ -5,3 +5,11 @@ datasets>=2.19.0
 pyahocorasick>=2.0.0
 rapidfuzz>=3.5.0
 Unidecode>=1.3.8
+torch
+transformers>=4.43
+peft
+bitsandbytes
+accelerate
+evaluate
+scikit-learn
+huggingface_hub
