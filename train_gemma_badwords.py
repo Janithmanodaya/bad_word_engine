@@ -363,11 +363,27 @@ def build_dataset(path: str, text_col: str, label_col: str, seed: int, val_size:
 
     # If no explicit validation, make a split
     if "validation" not in ds:
-        split = ds["train"].train_test_split(
-            test_size=val_size,
-            seed=seed,
-            stratify_by_column=label_col if label_col in ds["train"].column_names else None,
-        )
+        # Use stratification only if the label column is a ClassLabel feature
+        stratify = None
+        try:
+            feat = ds["train"].features.get(label_col, None)
+            # Avoid importing ClassLabel directly to keep dependencies light; check by class name
+            if feat is not None and feat.__class__.__name__ == "ClassLabel":
+                stratify = label_col
+        except Exception:
+            stratify = None
+
+        if stratify:
+            split = ds["train"].train_test_split(
+                test_size=val_size,
+                seed=seed,
+                stratify_by_column=stratify,
+            )
+        else:
+            split = ds["train"].train_test_split(
+                test_size=val_size,
+                seed=seed,
+            )
         ds = DatasetDict(train=split["train"], validation=split["test"])
 
     # Ensure required columns exist
