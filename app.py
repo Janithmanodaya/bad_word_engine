@@ -1,16 +1,13 @@
 # Improved bad-words detection service (FastAPI)
-# - Faster substring search using Aho-Corasick (optional: pyahocorasick)
-# - Optional fuzzy matching with rapidfuzz for obfuscated tokens
-# - Better deobfuscation and spaced-letter handling
-# - Graceful fallbacks if optional libraries are not installed
-# - Maintains previous data-source behavior (LDNOOBW, MRVLS, SOLD, SemiSOLD, custom env lists)
+# Adds ML model (joblib) as the primary detector. If the model predicts "bad", we return immediately.
+# If the model predicts "clean" or is unavailable, we fall back to the lexicon-based filters already implemented.
+# Decision path is logged at INFO level.
 
 import os
 import re
 import unicodedata
 import logging
 from typing import List, Set, Tuple, Optional, Dict
-from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
@@ -44,12 +41,17 @@ def _get_log_level() -> int:
 
 
 logging.basicConfig(level=_get_log_level(), format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("badwords_improved")
+logger = logging.getLogger("badwords_service")
 
 # Globals
 BAD_WORDS_EN: Set[str] = set()
 BAD_WORDS_SI: Set[str] = set()
 BAD_WORDS_SI_SINGLISH: Set[str] = set()
+
+# ML model globals
+MODEL_AVAILABLE: bool = False
+MODEL_PATH: str = ""
+_model_bundle = None  # holds {"vec_char", "vec_word", "classifier"}
 
 # Minimal built-in fallback list to avoid empty English lexicon when remote fetch fails
 DEFAULT_EN_BAD_WORDS: Set[str] = {
@@ -98,12 +100,6 @@ SINHALA_STOPWORDS: Set[str] = {
     "ඉතින්",
 }
 
-# Sinhala suffixes for common inflections/plurals to catch variants
-SI_SUFFIXES: Set[str] = {
-    "යා", "යෝ", "යො", "යෙක්", "ට", "ටා", "ටෙක්", "ක", "නේ", "ටු", "ටෝ",
-    "ටො", "ටය", "ය", "යි", "ගේ", "ව", "වට", "වමු", "වෝ", "වො",
-}
-
 # Built-in Sinhala bad word lemmas (minimal curated set)
 DEFAULT_SI_BAD_WORDS: Set[str] = {
     "මෝඩ",     # fool / stupid
@@ -126,12 +122,10 @@ AC_AUTOMATON_EN = None
 AC_AUTOMATON_SI = None
 AC_AUTOMATON_SI_SING = None
 
-# Fuzzy match cache (simple)
-
 # Precompiled regexes
 RE_LATIN = re.compile(r"[A-Za-z']+")
 RE_SINHALA = re.compile(r"[\u0D80-\u0DFF]+")
-RE_WORDSEP = re.compile(r"[\s\-\_\.,;:\|\\/]+")
+RE_WORDSEP = re.compile(r"[\s\-_,.;:\|\\/]+")
 RE_NONALNUM = re.compile(r"[^\w\u0D80-\u0DFF]", flags=re.UNICODE)
 
 
@@ -140,7 +134,7 @@ def _preview(text: str, n: int = 140) -> str:
 
 
 def normalize_text(text: str) -> str:
-    t = unicodedata.normalize("NFKC", text)
+    t = unicodedata.normalize("NFKC", str(text))
     t = t.replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
     # remove control chars
     t = "".join(ch for ch in t if unicodedata.category(ch)[0] != "C")
@@ -169,19 +163,14 @@ HOMOGLYPH_MAP: Dict[str, str] = {
 
 
 def deobfuscate(text: str) -> str:
-    """Produce several deobfuscated variants of input text.
-    - map common leet/homoglyphs
-    - collapse long character repeats
-    - remove non-alnum separators between letters (eg: s.h.i.t -> shit)
-    - transliterate if unidecode available
-    """
+    """Produce several deobfuscated variants of input text."""
     t = normalize_text(text)
     before = t
     # replace homoglyphs
     t = "".join(HOMOGLYPH_MAP.get(ch, ch) for ch in t)
-    # collapse >2 repeats to two (a lot of spam repeats characters)
+    # collapse >2 repeats to two
     t = re.sub(r"(.)\1{2,}", r"\1\1", t)
-    # join letters that are separated by punctuation/spaces: s.h.i.t -> shit
+    # join letters separated by punctuation/spaces: s.h.i.t -> shit
     t = re.sub(r"(?:[\W_])+(?=[A-Za-z])", "", t)
     # transliterate (latin-friendly) to help fuzzy match
     if HAS_UNIDECODE:
@@ -217,7 +206,7 @@ def _requests_session() -> requests.Session:
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     headers = {
-        "User-Agent": "badwords-service/1.1 (+https://example.local)",
+        "User-Agent": "badwords-service/1.2 (+https://example.local)",
         "Accept": "text/plain,*/*;q=0.8",
     }
     token = os.getenv("GITHUB_TOKEN", "").strip()
@@ -248,14 +237,12 @@ def _expand_mirrors(url: str) -> List[str]:
     m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)", url)
     if m:
         user, repo, branch, path = m.groups()
-        # Prefer stable mirrors; remove fastgit due to frequent DNS failures
         urls.append(f"https://cdn.jsdelivr.net/gh/{user}/{repo}@{branch}/{path}")
         urls.append(f"https://rawcdn.githack.com/{user}/{repo}/{branch}/{path}")
     return urls
 
 
-# --- Loading lexicons (same logic as original but we build automata if available)
-
+# --- Loading lexicons
 def load_en_bad_words() -> Set[str]:
     override = os.getenv("BAD_WORDS_EN_URL", "").strip()
     if override:
@@ -279,7 +266,6 @@ def load_en_bad_words() -> Set[str]:
             break
 
     if not words:
-        # Fallback to built-in minimal list to ensure service remains functional
         logger.warning(
             "LDNOOBW fetch failed; using built-in minimal English list. "
             "Set BAD_WORDS_EN_URL to your own list for full coverage."
@@ -289,9 +275,6 @@ def load_en_bad_words() -> Set[str]:
     logger.info("Loaded %d English bad words", len(words))
     return words
 
-
-# reused load_si_bad_words_mrmrvl() and SOLD loaders from previous script pattern
-# For brevity in this example we'll call the same functions as before but keep them small
 
 def load_si_bad_words_mrmrvl() -> Tuple[Set[str], Set[str]]:
     logger.info("Loading Sinhala MRVLS lists (unicode + singlish)...")
@@ -333,10 +316,7 @@ def load_si_bad_words_mrmrvl() -> Tuple[Set[str], Set[str]]:
     return si_unicode, si_singlish
 
 
-# SOLD loader with fallback disabled if datasets isn't available
-
 def load_si_bad_words_sold() -> Set[str]:
-    # Default to disabled to avoid noisy lexicon unless explicitly enabled
     if os.getenv("USE_SOLD", "0").lower() not in {"1", "true", "yes"}:
         logger.info("USE_SOLD disabled; skipping SOLD load.")
         return set()
@@ -360,7 +340,6 @@ def load_si_bad_words_sold() -> Set[str]:
     for split_name in sold.keys():
         split = sold[split_name]
         for item in split:
-            # heuristic same as original: look for rationale tokens
             tokens = None
             for k in ("tokens", "token", "words", "word_tokens"):
                 if item.get(k) is not None:
@@ -374,9 +353,7 @@ def load_si_bad_words_sold() -> Set[str]:
             if not tokens or rationals is None:
                 continue
 
-            # normalize tokens to list[str]
             if isinstance(tokens, str):
-                # try to interpret as python list literal first
                 try:
                     parsed_tokens = ast.literal_eval(tokens)
                     if isinstance(parsed_tokens, (list, tuple)):
@@ -388,10 +365,8 @@ def load_si_bad_words_sold() -> Set[str]:
             else:
                 toks = [str(x) for x in tokens]
 
-            # normalize rationals/rationales to list[int]
             rats: List[int] = []
             if isinstance(rationals, str):
-                # attempt to parse python-style list or fall back to digits extraction
                 try:
                     parsed = ast.literal_eval(rationals)
                     if isinstance(parsed, (list, tuple)):
@@ -420,7 +395,6 @@ def load_si_bad_words_sold() -> Set[str]:
                 except Exception:
                     rats = []
 
-            # iterate safely over aligned pairs
             for t, r in zip(toks, rats):
                 if r == 1:
                     words.add(t)
@@ -454,10 +428,9 @@ def load_custom_words_from_env() -> Tuple[Set[str], Set[str], Set[str]]:
 
     return en, si, si_sing
 
+
 def load_additional_si_bad_csv(path: str = "bad.csv") -> Set[str]:
-    """
-    Load comma-separated Sinhala bad words from a local CSV file.
-    """
+    """Load comma-separated Sinhala bad words from a local CSV file."""
     words: Set[str] = set()
     try:
         if not path:
@@ -469,7 +442,7 @@ def load_additional_si_bad_csv(path: str = "bad.csv") -> Set[str]:
         with open(p, "r", encoding="utf-8") as f:
             content = f.read()
         import re as _re
-        tokens = [tok.strip() for tok in _re.split(r"[,\n;]+", content) if tok.strip()]
+        tokens = [tok.strip() for tok in _re.split(r"[,\\n;]+", content) if tok.strip()]
         try:
             with open(p, "r", encoding="utf-8", newline="") as f2:
                 reader = csv.reader(f2, delimiter=",")
@@ -556,15 +529,15 @@ def init_lexicons() -> None:
 
     # Build Sinhala set and apply stopword filter, include built-in defaults
     BAD_WORDS_SI = set(DEFAULT_SI_BAD_WORDS)
-    # Include additional Sinhala words from local CSV (bad.csv by default)
     si_extra_csv = load_additional_si_bad_csv(os.getenv("BAD_CSV_PATH", "bad.csv"))
     for w in si_unicode_mrmrvl.union(si_sold).union(si_semisold).union(si_extra_csv):
         w_norm = unicodedata.normalize("NFKC", w)
-        if len(w_norm <) 3:
+        if len(w_norm) < 3:
             continue
         if w_norm in SINHALA_STOPWORDS:
             continue
-        BAD_WORDS_S
+        BAD_WORDS_SI.add(w_norm)
+
     # Singlish set (lowercased) include built-in defaults
     BAD_WORDS_SI_SINGLISH = set(x.lower() for x in DEFAULT_SINGLISH_BAD_WORDS)
     for w in si_singlish_mrmrvl:
@@ -576,7 +549,6 @@ def init_lexicons() -> None:
     # Custom overrides from env
     en_c, si_c, si_sing_c = load_custom_words_from_env()
     BAD_WORDS_EN.update(en_c)
-    # Apply stopword filter to env Sinhala too
     BAD_WORDS_SI.update({unicodedata.normalize("NFKC", w) for w in si_c if len(w) >= 3 and w not in SINHALA_STOPWORDS})
     BAD_WORDS_SI_SINGLISH.update({w.lower() for w in si_sing_c if len(w) >= 2})
 
@@ -584,8 +556,7 @@ def init_lexicons() -> None:
     if HAS_AHO:
         try:
             AC_AUTOMATON_EN = build_automaton(BAD_WORDS_EN)
-            # Avoid Sinhala substring automaton to reduce false positives; keep Singlish
-            AC_AUTOMATON_SI = None
+            AC_AUTOMATON_SI = None  # Avoid Sinhala substring automaton to reduce false positives
             AC_AUTOMATON_SI_SING = build_automaton(BAD_WORDS_SI_SINGLISH)
             logger.info("Aho-Corasick automatons built (enabled for EN/Singlish)")
         except Exception as e:
@@ -605,17 +576,96 @@ def init_lexicons() -> None:
     )
 
 
-# Matching helpers
+# --- ML model loader/inference ---
 
+def _prepare_unpickle_namespace() -> None:
+    """
+    Ensure joblib can unpickle vectorizers that reference normalize_text
+    from train_gemma_badwords by providing a stub module in sys.modules.
+    """
+    try:
+        import types, sys as _sys
+        if "train_gemma_badwords" not in _sys.modules:
+            mod = types.ModuleType("train_gemma_badwords")
+            # Provide a compatible normalize_text used during training
+            def _norm(t: str) -> str:
+                s = normalize_text(t)
+                # match training behavior: collapse repeats and remove separators
+                s = re.sub(r"(.)\\1{2,}", r"\\1\\1", s)
+                s = re.sub(r"(?:[\\W_])+(?=[A-Za-z])", "", s)
+                if HAS_UNIDECODE:
+                    try:
+                        return unidecode(s)
+                    except Exception:
+                        return s
+                return s
+            mod.normalize_text = _norm  # type: ignore[attr-defined]
+            _sys.modules["train_gemma_badwords"] = mod
+    except Exception as e:
+        logger.warning("Failed to prepare unpickle namespace: %s", e)
+
+
+def load_model() -> None:
+    """Load joblib model bundle from MODEL_DIR (default: ./model/model.joblib)."""
+    global MODEL_AVAILABLE, MODEL_PATH, _model_bundle
+    MODEL_AVAILABLE = False
+    _model_bundle = None
+
+    model_dir = os.getenv("MODEL_DIR", "model").strip() or "model"
+    model_file = os.path.join(model_dir, "model.joblib")
+    MODEL_PATH = model_file
+    if not os.path.exists(model_file):
+        logger.info("Model file not found at %s; ML detector disabled.", model_file)
+        return
+
+    try:
+        _prepare_unpickle_namespace()
+        from joblib import load as joblib_load  # type: ignore
+        _model_bundle = joblib_load(model_file)
+        # Sanity check
+        for key in ("vec_char", "vec_word", "classifier"):
+            if key not in _model_bundle:
+                raise ValueError(f"Model bundle missing '{key}'")
+        MODEL_AVAILABLE = True
+        logger.info("ML model loaded from %s", model_file)
+    except Exception as e:
+        logger.warning("Failed to load ML model from %s: %s", model_file, e)
+        MODEL_AVAILABLE = False
+        _model_bundle = None
+
+
+def model_predict_is_bad(text: str) -> Optional[bool]:
+    """
+    Return True if model predicts 'bad', False if 'clean', or None if model unavailable or error.
+    """
+    if not MODEL_AVAILABLE or _model_bundle is None:
+        return None
+    try:
+        vec_char = _model_bundle["vec_char"]
+        vec_word = _model_bundle["vec_word"]
+        clf = _model_bundle["classifier"]
+        # The vectorizers already embed normalization preprocessors from training.
+        Xc = vec_char.transform([text])
+        Xw = vec_word.transform([text])
+        # Use scipy.sparse.hstack without importing globally (avoid heavy dep in import path)
+        from scipy.sparse import hstack as _hstack  # type: ignore
+        X = _hstack([Xc, Xw])
+        y_pred = clf.predict(X)
+        return bool(int(y_pred[0]) == 1)
+    except Exception as e:
+        logger.warning("Model inference failed: %s", e)
+        return None
+
+
+# Matching helpers
 def _automaton_find(automaton, text: str) -> Set[str]:
     hits = set()
     if automaton is None:
         return hits
     try:
-        for end_index, (idx, word) in automaton.iter(text):
+        for _, (_, word) in automaton.iter(text):
             hits.add(word)
     except Exception:
-        # fallback safe iteration
         return set()
     return hits
 
@@ -631,17 +681,13 @@ def _match_substrings_simple(text: str, candidates: Set[str], min_len: int = 3) 
 
 
 def _fuzzy_hits(token: str, candidates: Set[str], limit: int = 5, threshold: int = 80) -> Set[str]:
-    """Return candidate words that fuzzily match token above threshold.
-    Uses rapidfuzz if available, else empty set.
-    """
+    """Return candidate words that fuzzily match token above threshold."""
     if not HAS_RAPIDFUZZ:
         return set()
     try:
-        # use process.extract to get best matches
         results = process.extract(token, list(candidates), scorer=fuzz.partial_ratio, limit=limit)
         return {r[0] for r, score, _ in results if score >= threshold}
     except Exception:
-        # last-resort naive matching
         out = set()
         for w in candidates:
             if token in w or w in token:
@@ -650,18 +696,9 @@ def _fuzzy_hits(token: str, candidates: Set[str], limit: int = 5, threshold: int
 
 
 def find_bad_words(text: str, fuzzy_threshold: int = 85) -> Set[str]:
-    """Find bad words in text. Returns a set of matched lexicon strings.
-    Strategy:
-    - create normalized & deobfuscated variants
-    - use Aho-Corasick if available for fast substrings
-    - token-level exact matches for latin/sinhala tokens
-    - fallback substring scanning
-    - optional fuzzy matching for short/obfuscated tokens using rapidfuzz
-    """
+    """Lexicon-based bad words finder (fallback when model says 'clean' or is unavailable)."""
     hits: Set[str] = set()
     variants = [normalize_text(text), deobfuscate(text), RE_NONALNUM.sub("", normalize_text(text))]
-
-    # also consider a collapsed-spaces variant: remove separators between letters
     variants.append(RE_WORDSEP.sub("", normalize_text(text)))
 
     tried = set()
@@ -671,7 +708,6 @@ def find_bad_words(text: str, fuzzy_threshold: int = 85) -> Set[str]:
         tried.add(v)
         logger.debug("Variant preview=%s", _preview(v))
 
-        # Aho-corasick fast substring search
         if HAS_AHO and AC_AUTOMATON_SI is not None:
             hits.update(_automaton_find(AC_AUTOMATON_SI, v))
         if HAS_AHO and AC_AUTOMATON_EN is not None:
@@ -679,7 +715,6 @@ def find_bad_words(text: str, fuzzy_threshold: int = 85) -> Set[str]:
         if HAS_AHO and AC_AUTOMATON_SI_SING is not None:
             hits.update(_automaton_find(AC_AUTOMATON_SI_SING, v))
 
-        # token-level checks (exact)
         latin_tokens, sinhala_tokens = tokenize(v)
         for tok in latin_tokens:
             if tok in BAD_WORDS_EN or tok in BAD_WORDS_SI_SINGLISH:
@@ -688,20 +723,16 @@ def find_bad_words(text: str, fuzzy_threshold: int = 85) -> Set[str]:
             if tok in BAD_WORDS_SI:
                 hits.add(tok)
 
-        # substring fallback (slower) for missing automaton
         if not HAS_AHO:
             hits.update(_match_substrings_simple(v, BAD_WORDS_SI, min_len=2))
             hits.update(_match_substrings_simple(v, BAD_WORDS_EN, min_len=3))
             hits.update(_match_substrings_simple(v, BAD_WORDS_SI_SINGLISH, min_len=3))
 
-        # fuzzy matching for short tokens or extremely obfuscated tokens
         if HAS_RAPIDFUZZ:
-            # check latin tokens fuzzily
             for tok in latin_tokens:
                 if 2 <= len(tok) <= 40:
                     f = _fuzzy_hits(tok, BAD_WORDS_EN.union(BAD_WORDS_SI_SINGLISH), limit=5, threshold=fuzzy_threshold)
                     hits.update(f)
-            # check whole string fuzzy against english list if short
             s = v.strip()
             if 3 <= len(s) <= 40:
                 f2 = _fuzzy_hits(s, BAD_WORDS_EN.union(BAD_WORDS_SI_SINGLISH), limit=5, threshold=max(60, fuzzy_threshold - 15))
@@ -733,13 +764,17 @@ app = FastAPI()
 
 @app.on_event("startup")
 def on_startup():
+    load_model()
     init_lexicons()
+    logger.info("Startup complete. MODEL_AVAILABLE=%s", MODEL_AVAILABLE)
 
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
+        "model_available": MODEL_AVAILABLE,
+        "model_path": MODEL_PATH,
         "en_words": len(BAD_WORDS_EN),
         "si_words": len(BAD_WORDS_SI),
         "si_singlish_words": len(BAD_WORDS_SI_SINGLISH),
@@ -758,12 +793,32 @@ def check_api_key(req: Request, expected_key: str) -> None:
 async def check_default(req: Request, payload: CheckRequest):
     api_key = os.getenv("API_KEY", "")
     check_api_key(req, api_key)
-    logger.info("Incoming /check: advanced=%s text_preview=%s", payload.advanced, _preview(payload.text))
+    text_preview = _preview(payload.text)
+    logger.info("Incoming /check: advanced=%s text_preview=%s", payload.advanced, text_preview)
+
+    # 1) Try ML model first if available
+    model_result = model_predict_is_bad(payload.text)
+    if model_result is True:
+        logger.info("Decision: model=BAD -> returning found=True (priority: model). text_preview=%s", text_preview)
+        if payload.advanced:
+            # We can also return lexicon hits to help explain, but model took precedence
+            hits = find_bad_words(payload.text)
+            logger.info("Model decided BAD; lexicon hits=%d (for transparency).", len(hits))
+            return AdvancedResponse(found=True, bad_words=sorted(hits))
+        return DefaultResponse(found=True)
+    elif model_result is False:
+        logger.info("Decision: model=CLEAN -> falling back to lexicon filters. text_preview=%s", text_preview)
+    else:
+        logger.info("Decision: model=UNAVAILABLE/ERROR -> using lexicon filters only. text_preview=%s", text_preview)
+
+    # 2) Fallback: lexicon-based detection
     hits = find_bad_words(payload.text)
-    logger.info("Outgoing /check: found=%s hits=%d", bool(hits), len(hits))
+    found = bool(hits)
+    logger.info("Fallback lexicon decision: found=%s hits=%d text_preview=%s", found, len(hits), text_preview)
+
     if payload.advanced:
-        return AdvancedResponse(found=bool(hits), bad_words=sorted(hits, key=lambda s: (len(s), s)))
-    return DefaultResponse(found=bool(hits))
+        return AdvancedResponse(found=found, bad_words=sorted(hits, key=lambda s: (len(s), s)))
+    return DefaultResponse(found=found)
 
 
 # Helpful __main__ for quick local testing
@@ -774,11 +829,15 @@ if __name__ == "__main__":
         "ඔබ ම*ල*කේ",
         "obfu$cat3d discussion",
         "mama api *******",
+        "harak modaya",
     ]
+    load_model()
     init_lexicons()
     for ex in examples:
         print("> ", ex)
-        print("  hits:", find_bad_words(ex))
+        mr = model_predict_is_bad(ex)
+        print("  model:", mr)
+        print("  lexicon hits:", find_bad_words(ex))
 
     # run uvicorn when invoked directly
     import uvicorn
