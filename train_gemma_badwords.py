@@ -517,34 +517,89 @@ def build_dataset(path: str, text_col: str, label_col: str, seed: int, val_size:
     return ds
 
 
-def build_sold_dataset(seed: int, val_size: float) -> DatasetDict:
+def build_sold_dataset(seed: int, val_size: float, train_path: Optional[str] = None, test_path: Optional[str] = None, trial_path: Optional[str] = None) -> DatasetDict:
     """
-    Load SOLD (Sinhala Offensive Language Dataset) from Hugging Face and return a DatasetDict
-    with 'train' and 'validation' splits. Columns used: text (features) and label (targets).
+    Load SOLD (Sinhala Offensive Language Dataset).
+    Preferred: Hugging Face hub 'sinhala-nlp/SOLD'.
+    Fallback: local TSV files if hub load fails. Expects columns containing text and label.
+    Returns DatasetDict with 'train' and 'validation' splits.
     """
-    logging.info("[SOLD] Loading 'sinhala-nlp/SOLD' from Hugging Face hub")
-    raw = load_dataset("sinhala-nlp/SOLD")
-    # Prefer official train/test; fall back to creating a split if necessary
-    if isinstance(raw, dict):
-        if "train" in raw and "test" in raw:
-            ds = DatasetDict({"train": raw["train"], "validation": raw["test"]})
-        elif "train" in raw and "validation" in raw:
-            ds = DatasetDict({"train": raw["train"], "validation": raw["validation"]})
+    logging.info("[SOLD] Attempting to load 'sinhala-nlp/SOLD' from Hugging Face hub")
+    ds: Optional[DatasetDict] = None
+    try:
+        raw = load_dataset("sinhala-nlp/SOLD")
+        # Prefer official train/test; fall back to creating a split if necessary
+        if isinstance(raw, dict):
+            if "train" in raw and "test" in raw:
+                ds = DatasetDict({"train": raw["train"], "validation": raw["test"]})
+            elif "train" in raw and "validation" in raw:
+                ds = DatasetDict({"train": raw["train"], "validation": raw["validation"]})
+            else:
+                # Single split present; create validation
+                base = list(raw.values())[0]
+                split = base.train_test_split(test_size=val_size, seed=seed)
+                ds = DatasetDict({"train": split["train"], "validation": split["test"]})
         else:
-            # Single split present; create validation
-            base = list(raw.values())[0]
-            split = base.train_test_split(test_size=val_size, seed=seed)
+            # Unexpected structure; make a split
+            split = raw.train_test_split(test_size=val_size, seed=seed)
             ds = DatasetDict({"train": split["train"], "validation": split["test"]})
-    else:
-        # Unexpected structure; make a split
-        split = raw.train_test_split(test_size=val_size, seed=seed)
-        ds = DatasetDict({"train": split["train"], "validation": split["test"]})
+        logging.info("[SOLD] Hub dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
+    except Exception as e:
+        logging.warning("[SOLD] Hub load failed: %s. Trying local TSV fallback.", e)
 
-    # Confirm columns exist
+    # Local TSV fallback
+    if ds is None:
+        # Default paths if not provided
+        train_p = train_path or "data/SOLD_train.tsv"
+        test_p = test_path or "data/SOLD_test.tsv"
+        trial_p = trial_path or "data/SOLD_trial.tsv"
+
+        def _maybe_load_tsv(path: str, split_name: str):
+            if os.path.exists(path):
+                logging.info("[SOLD] Loading local TSV: %s (%s split)", path, split_name)
+                return load_dataset("csv", data_files={split_name: path}, delimiter="\t")[split_name]
+            else:
+                logging.warning("[SOLD] Local TSV not found: %s", path)
+                return None
+
+        train_split = _maybe_load_tsv(train_p, "train")
+        test_split = _maybe_load_tsv(test_p, "validation")  # map test to validation
+        trial_split = _maybe_load_tsv(trial_p, "trial")
+
+        # If test not present, create validation from train
+        if train_split is None:
+            raise FileNotFoundError("[SOLD] Local TSV fallback failed: training file not found.")
+        if test_split is None:
+            logging.info("[SOLD] Validation TSV not found; creating validation split from train at ratio %.2f", val_size)
+            split = train_split.train_test_split(test_size=val_size, seed=seed)
+            ds = DatasetDict({"train": split["train"], "validation": split["test"]})
+        else:
+            ds = DatasetDict({"train": train_split, "validation": test_split})
+
+        # Heuristically select text/label columns if not exactly 'text' and 'label'
+        def _guess_columns(column_names: List[str]) -> (str, str):
+            text_candidates = ["text", "comment", "sentence", "content"]
+            label_candidates = ["label", "labels", "gold_label", "class", "target"]
+            text_col = next((c for c in text_candidates if c in column_names), None)
+            label_col = next((c for c in label_candidates if c in column_names), None)
+            if not text_col or not label_col:
+                raise ValueError(f"[SOLD] Could not infer text/label columns from: {column_names}")
+            return text_col, label_col
+
+        # Normalize to expected columns names
+        tcol_train, lcol_train = _guess_columns(ds["train"].column_names)
+        tcol_val, lcol_val = _guess_columns(ds["validation"].column_names)
+        if tcol_train != "text" or lcol_train != "label":
+            ds = ds.rename_column(tcol_train, "text").rename_column(lcol_train, "label")
+        if tcol_val != "text" or lcol_val != "label":
+            ds = ds.rename_column(tcol_val, "text").rename_column(lcol_val, "label")
+
+        logging.info("[SOLD] Local TSV dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
+
+    # Final confirmation
     for col in ("text", "label"):
         if col not in ds["train"].column_names:
             raise ValueError(f"[SOLD] Column '{col}' not found. Available: {ds['train'].column_names}")
-    logging.info("[SOLD] Dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
     return ds
 
 # ---------------------------
@@ -604,7 +659,11 @@ def main():
     parser.add_argument("--colab_keepalive", action="store_true", help="Enable a lightweight keepalive thread to reduce Colab idle disconnects.")
     parser.add_argument("--colab_keepalive_interval", type=int, default=60, help="Keepalive ping interval in seconds (default: 60).")
     # Use SOLD dataset
-    parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub instead of local file/auto wordlists.")
+    parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub. If hub load fails, fallback to local TSV files.")
+    parser.add_argument("--sold_train_path", type=str, default="data/SOLD_train.tsv", help="Local path to SOLD train TSV (fallback).")
+    parser.add_argument("--sold_test_path", type=str, default="data/SOLD_test.tsv", help="Local path to SOLD test TSV as validation (fallback).")
+    parser.add_argument("--sold_trial_path", type=str, default="data/SOLD_trial.tsv", help="Local path to SOLD trial TSV (optional, unused for training).new"</)
+")
     # Auth and fallback
     parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"), help="Hugging Face token for gated models.")
     parser.add_argument("--fallback_model", type=str, default="Qwen/Qwen2-1.5B-Instruct", help="Fallback open model if base model is gated and no token.")
@@ -799,8 +858,14 @@ def main():
 
     # Dataset
     if args.use_sold:
-        ds = build_sold_dataset(seed=args.seed, val_size=args.val_size)
-        # SOLD uses text/label columns by definition
+        ds = build_sold_dataset(
+            seed=args.seed,
+            val_size=args.val_size,
+            train_path=args.sold_train_path,
+            test_path=args.sold_test_path,
+            trial_path=args.sold_trial_path,
+        )
+        # Normalize expected columns
         args.text_column = "text"
         args.label_column = "label"
         logging.info("[SOLD] Using columns text='%s', label='%s'", args.text_column, args.label_column)
