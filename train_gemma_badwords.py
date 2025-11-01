@@ -515,10 +515,15 @@ def main():
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
         active_model_id = args.base_model
-    except GatedRepoError as ge:
-        logging.warning(f"Base model gated and not accessible: {ge}. Falling back to {args.fallback_model}")
-        tokenizer = AutoTokenizer.from_pretrained(args.fallback_model, use_fast=True)
-        active_model_id = args.fallback_model
+    except Exception as e:
+        # Some environments raise OSError instead of GatedRepoError for gated repos
+        msg = str(e).lower()
+        if isinstance(e, GatedRepoError) or "gated repo" in msg or "401" in msg or "unauthorized" in msg:
+            logging.warning(f"Base model not accessible ({e}). Falling back to {args.fallback_model}")
+            tokenizer = AutoTokenizer.from_pretrained(args.fallback_model, use_fast=True)
+            active_model_id = args.fallback_model
+        else:
+            raise
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -576,9 +581,11 @@ def main():
     logging.info(f"Loading base model: {active_model_id}")
     try:
         model = AutoModelForSequenceClassification.from_pretrained(active_model_id, **model_kwargs)
-    except GatedRepoError as ge:
-        if active_model_id != args.fallback_model:
-            logging.warning(f"Model gated and not accessible: {ge}. Falling back to {args.fallback_model}")
+    except Exception as e:
+        msg = str(e).lower()
+        is_gated = isinstance(e, GatedRepoError) or "gated repo" in msg or "401" in msg or "unauthorized" in msg
+        if is_gated and active_model_id != args.fallback_model:
+            logging.warning(f"Model not accessible ({e}). Falling back to {args.fallback_model}")
             active_model_id = args.fallback_model
             config = AutoConfig.from_pretrained(active_model_id, num_labels=num_labels)
             model_kwargs["config"] = config
