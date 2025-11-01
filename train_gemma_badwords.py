@@ -7,8 +7,10 @@ Key features:
 - GPU-first: 4-bit quantization (bitsandbytes) + LoRA for low VRAM training on a gaming PC.
 - CPU fallback: allowed only with --force_cpu (may OOM for Gemma; not recommended).
 - Handles CSV/JSON/JSONL; can also download dataset from a URL (--dataset_url).
+- Can auto-build a dataset from public bad-word lists (--auto_wordlists).
 - Class imbalance aware (weighted cross-entropy).
 - Saves a tiny LoRA adapter usable on very small servers for inference.
+- Detailed logging to console and file for progress tracking.
 
 Quick usage (no manual installs needed):
     python train_gemma_badwords.py \\
@@ -33,6 +35,7 @@ import urllib.request
 from typing import Optional, List
 import shutil
 import time
+import logging
 
 # ---------------------------
 # Bootstrap: ensure dependencies installed
@@ -53,7 +56,7 @@ REQUIRED_PKGS = [
 ]
 
 def _pip_install(spec: str) -> None:
-    print(f"[setup] Installing: {spec}")
+    logging.getLogger("setup").info(f"Installing: {spec}")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", spec])
 
 def _is_installed(module: str) -> bool:
@@ -107,12 +110,87 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from transformers.utils import logging as hf_logging
 from peft import (
     LoraConfig,
     TaskType,
     get_peft_model,
     prepare_model_for_kbit_training,
 )
+
+# ---------------------------
+# Wordlist utilities
+# ---------------------------
+
+DEFAULT_BADWORDS_REPO = "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master"
+DEFAULT_CLEANWORDS_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt"
+
+def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO) -> List[str]:
+    bad = []
+    for lang in langs:
+        url = f"{repo_base}/{lang.strip()}"
+        try:
+            logging.info(f"[wordlist] Downloading bad words for '{lang}' from {url}")
+            with urllib.request.urlopen(url) as r:
+                for line in r.read().decode("utf-8", errors="ignore").splitlines():
+                    w = line.strip()
+                    if not w or w.startswith("#"):
+                        continue
+                    bad.append(w)
+        except Exception as e:
+            logging.warning(f"[wordlist] Failed to download {url}: {e}")
+    # Deduplicate, keep order
+    seen = set()
+    uniq = []
+    for w in bad:
+        wl = w.lower()
+        if wl not in seen:
+            seen.add(wl)
+            uniq.append(wl)
+    logging.info(f"[wordlist] Total bad words collected: {len(uniq)}")
+    return uniq
+
+def download_clean_words(url: str = DEFAULT_CLEANWORDS_URL, limit: int = 10000) -> List[str]:
+    clean = []
+    try:
+        logging.info(f"[wordlist] Downloading clean words from {url}")
+        with urllib.request.urlopen(url) as r:
+            for i, line in enumerate(r.read().decode("utf-8", errors="ignore").splitlines()):
+                if not line:
+                    continue
+                clean.append(line.strip().lower())
+                if limit and len(clean) >= limit:
+                    break
+    except Exception as e:
+        logging.warning(f"[wordlist] Failed to download clean words: {e}")
+    logging.info(f"[wordlist] Total clean words collected: {len(clean)}")
+    return clean
+
+def build_wordlist_dataset_csv(out_path: str, bad_words: List[str], clean_words: List[str], augment_context: bool = True) -> None:
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    import csv
+    logging.info(f"[wordlist] Building dataset CSV at {out_path}")
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["text", "label"])
+        # Bad words = 1
+        for w in bad_words:
+            if augment_context:
+                # Simple contexts to help model generalize beyond single-token inputs
+                examples = [w, f"You are {w}.", f"That was {w}!", f"{w} behavior."]
+                for t in examples:
+                    writer.writerow([t, 1])
+            else:
+                writer.writerow([w, 1])
+        # Clean words = 0
+        for w in clean_words:
+            if augment_context:
+                examples = [w, f"This is {w}.", f"A very {w} idea.", f"{w} example."]
+                for t in examples:
+                    writer.writerow([t, 0])
+            else:
+                writer.writerow([w, 0])
+    logging.info(f"[wordlist] Wrote dataset rows: bad≈{len(bad_words)}xN, clean≈{len(clean_words)}xN")
 
 # ---------------------------
 # Utilities
@@ -176,7 +254,7 @@ def maybe_download_dataset(dataset_path: str, dataset_url: Optional[str]) -> str
         return dataset_path
     if dataset_url:
         os.makedirs(os.path.dirname(dataset_path) or ".", exist_ok=True)
-        print(f"[data] Downloading dataset from {dataset_url} -> {dataset_path}")
+        logging.info(f"[data] Downloading dataset from {dataset_url} -> {dataset_path}")
         with urllib.request.urlopen(dataset_url) as r, open(dataset_path, "wb") as f:
             shutil.copyfileobj(r, f)
         return dataset_path
@@ -244,6 +322,15 @@ def main():
     parser = argparse.ArgumentParser(description="Self-installing QLoRA trainer for Gemma bad-word classification.")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to CSV/JSON/JSONL with text+label columns.")
     parser.add_argument("--dataset_url", type=str, default=None, help="Optional URL to download dataset if dataset_path is missing.")
+    # Auto wordlist options
+    parser.add_argument("--auto_wordlists", action="store_true", help="Build dataset automatically from public word lists.")
+    parser.add_argument("--bad_words_langs", type=str, default="en", help="Comma-separated languages for bad-word lists (e.g., 'en,es,de').")
+    parser.add_argument("--bad_words_repo_url", type=str, default=DEFAULT_BADWORDS_REPO, help="Base repo URL for bad-word lists.")
+    parser.add_argument("--clean_words_url", type=str, default=DEFAULT_CLEANWORDS_URL, help="URL for clean words list.")
+    parser.add_argument("--wordlist_clean_limit", type=int, default=10000, help="Max number of clean words to use.")
+    parser.add_argument("--augment_context", action="store_true", help="Wrap words into short sentences for better generalization.")
+    parser.add_argument("--regenerate_wordlist", action="store_true", help="Rebuild dataset CSV from wordlists even if file exists.")
+    # Training/data params
     parser.add_argument("--text_column", type=str, default="text", help="Name of the text column.")
     parser.add_argument("--label_column", type=str, default="label", help="Name of the label column (0/1).")
     parser.add_argument("--base_model", type=str, default="google/gemma-2-2b-it", help="Base Gemma model to fine-tune.")
@@ -272,6 +359,21 @@ def main():
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
     args = parser.parse_args()
 
+    # Prepare output/logging
+    os.makedirs(args.output_dir, exist_ok=True)
+    log_path = os.path.join(args.output_dir, "train.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(log_path, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
+    )
+    # HF transformers logging
+    hf_logging.set_verbosity_info()
+    hf_logging.enable_default_handler()
+    hf_logging.enable_explicit_format()
+    logging.info("Starting Gemma bad-words training")
+    logging.info(f"Args: {vars(args)}")
+
     # Apply presets
     if args.preset == "low_vram":
         # Lower memory footprint settings
@@ -284,11 +386,31 @@ def main():
         # Slightly lower LR can stabilize with high accumulation
         args.learning_rate = min(args.learning_rate, 2e-4)
 
-    # Dataset presence or download
-    dataset_path = maybe_download_dataset(args.dataset_path, args.dataset_url)
+    # Build dataset from wordlists if requested
+    dataset_path = args.dataset_path
+    if args.auto_wordlists and (args.regenerate_wordlist or not os.path.exists(dataset_path)):
+        langs = [s.strip() for s in args.bad_words_langs.split(",") if s.strip()]
+        bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url)
+        clean_words = download_clean_words(url=args.clean_words_url, limit=args.wordlist_clean_limit)
+        if not bad_words:
+            logging.warning("[wordlist] No bad words downloaded; training may not be meaningful.")
+        if not clean_words:
+            logging.warning("[wordlist] No clean words downloaded; training may not be meaningful.")
+        build_wordlist_dataset_csv(dataset_path, bad_words, clean_words, augment_context=args.augment_context)
+
+    # Dataset presence or download otherwise
+    dataset_path = maybe_download_dataset(dataset_path, args.dataset_url)
 
     # Environment checks
     has_cuda = torch.cuda.is_available()
+    logging.info(f"PyTorch version: {torch.__version__}")
+    logging.info(f"CUDA available: {has_cuda}")
+    if has_cuda:
+        try:
+            logging.info(f"CUDA device count: {torch.cuda.device_count()}")
+            logging.info(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        except Exception:
+            pass
     if not has_cuda and not args.force_cpu:
         raise SystemExit(
             "No CUDA GPU detected. QLoRA with bitsandbytes requires an NVIDIA GPU. "
@@ -308,6 +430,16 @@ def main():
     # Dataset
     ds = build_dataset(dataset_path, args.text_column, args.label_column, seed=args.seed, val_size=args.val_size)
     ds = ensure_label_ints(ds, args.label_column)
+    # Log dataset stats
+    try:
+        import collections
+        cnt_train = collections.Counter(ds["train"][args.label_column])
+        cnt_val = collections.Counter(ds["validation"][args.label_column])
+        logging.info(f"Dataset sizes: train={len(ds['train'])}, validation={len(ds['validation'])}")
+        logging.info(f"Label distribution (train): {dict(cnt_train)}")
+        logging.info(f"Label distribution (validation): {dict(cnt_val)}")
+    except Exception as e:
+        logging.warning(f"Failed to log dataset stats: {e}")
 
     def tokenize_fn(batch):
         toks = tokenizer(batch[args.text_column], max_length=args.max_length, truncation=True)
@@ -345,7 +477,9 @@ def main():
         # CPU path (likely OOM for Gemma). No quantization_config.
         model_kwargs.update(dict(torch_dtype=torch.float32))
 
+    logging.info(f"Loading base model: {args.base_model}")
     model = AutoModelForSequenceClassification.from_pretrained(args.base_model, **model_kwargs)
+    logging.info(f"Model loaded. Dtype: {getattr(model, 'dtype', 'mixed')}, gradient_checkpointing={args.gradient_checkpointing}")
 
     if args.gradient_checkpointing and has_cuda:
         model.gradient_checkpointing_enable()
@@ -365,6 +499,7 @@ def main():
         bias="none",
         task_type=TaskType.SEQ_CLS,
     )
+    logging.info(f"LoRA config: r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, targets={target_modules}")
 
     model = get_peft_model(model, lora_cfg)
 
@@ -435,12 +570,20 @@ def main():
     )
 
     # Train
+    logging.info("Beginning training...")
     t0 = time.time()
-    trainer.train()
+    train_result = trainer.train()
     t1 = time.time()
+    logging.info(f"Training finished. Seconds: {round(t1 - t0, 2)}")
+    try:
+        metrics = train_result.metrics if hasattr(train_result, "metrics") else {}
+        logging.info(f"Train metrics: {metrics}")
+    except Exception:
+        pass
 
     # Save adapter and tokenizer only (small)
     os.makedirs(args.output_dir, exist_ok=True)
+    logging.info("Saving adapter and tokenizer...")
     trainer.model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
