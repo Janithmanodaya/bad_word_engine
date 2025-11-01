@@ -37,6 +37,7 @@ import shutil
 import time
 import logging
 from collections import defaultdict
+import threading
 
 # ---------------------------
 # Colab detection
@@ -590,6 +591,9 @@ def main():
     # Evaluation delay options
     parser.add_argument("--eval_start_step", type=int, default=0, help="Skip evaluation until this global step is reached.")
     parser.add_argument("--eval_start_epoch", type=float, default=0.0, help="Skip evaluation until this epoch number is reached.")
+    # Colab keepalive options
+    parser.add_argument("--colab_keepalive", action="store_true", help="Enable a lightweight keepalive thread to reduce Colab idle disconnects.")
+    parser.add_argument("--colab_keepalive_interval", type=int, default=60, help="Keepalive ping interval in seconds (default: 60).")
     # Use SOLD dataset
     parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub instead of local file/auto wordlists.")
     # Auth and fallback
@@ -652,6 +656,32 @@ def main():
     hf_logging.enable_explicit_format()
     logging.info("Starting Gemma bad-words training")
     logging.info(f"Args: {vars(args)}")
+
+    # ---------------------------
+    # Colab keepalive thread
+    # ---------------------------
+    def _colab_keepalive_loop(interval: int):
+        url = "https://clients3.google.com/generate_204"  # 204 response, light ping
+        while True:
+            try:
+                # Small network ping
+                with urllib.request.urlopen(url, timeout=10) as _r:
+                    pass
+                # Emit an invisible heartbeat to stdout to keep I/O active
+                sys.stdout.write("\u200B")
+                sys.stdout.flush()
+            except Exception:
+                # Avoid crashing the thread on transient failures
+                pass
+            time.sleep(max(10, int(interval)))
+
+    if in_colab() and args.colab_keepalive:
+        try:
+            t = threading.Thread(target=_colab_keepalive_loop, args=(args.colab_keepalive_interval,), daemon=True)
+            t.start()
+            logging.info("[colab] Keepalive thread started (interval=%ss).", args.colab_keepalive_interval)
+        except Exception as e:
+            logging.warning("[colab] Failed to start keepalive thread: %s", e)
 
     # Apply presets
     if args.preset == "low_vram" or in_colab():
