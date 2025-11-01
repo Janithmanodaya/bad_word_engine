@@ -323,15 +323,24 @@ def load_si_bad_words_sold() -> Set[str]:
             if not tokens or rationals is None:
                 continue
 
-            # normalize tokens to list
+            # normalize tokens to list[str]
             if isinstance(tokens, str):
-                toks = tokens.split()
+                # try to interpret as python list literal first
+                try:
+                    parsed_tokens = ast.literal_eval(tokens)
+                    if isinstance(parsed_tokens, (list, tuple)):
+                        toks = [str(x) for x in parsed_tokens]
+                    else:
+                        toks = str(parsed_tokens).split()
+                except Exception:
+                    toks = tokens.split()
             else:
-                toks = tokens
+                toks = [str(x) for x in tokens]
 
             # normalize rationals/rationales to list[int]
+            rats: List[int] = []
             if isinstance(rationals, str):
-                rats: List[int] = []
+                # attempt to parse python-style list or fall back to digits extraction
                 try:
                     parsed = ast.literal_eval(rationals)
                     if isinstance(parsed, (list, tuple)):
@@ -342,11 +351,14 @@ def load_si_bad_words_sold() -> Set[str]:
                                 continue
                     else:
                         for x in str(parsed).replace(",", " ").split():
-                            if x.isdigit():
-                                rats.append(int(x))
+                            if x.strip().lstrip("-").isdigit():
+                                try:
+                                    rats.append(int(x))
+                                except Exception:
+                                    continue
                 except Exception:
                     for x in rationals.replace("[", " ").replace("]", " ").replace(",", " ").split():
-                        if x.isdigit():
+                        if x.strip().lstrip("-").isdigit():
                             try:
                                 rats.append(int(x))
                             except Exception:
@@ -357,6 +369,7 @@ def load_si_bad_words_sold() -> Set[str]:
                 except Exception:
                     rats = []
 
+            # iterate safely over aligned pairs
             for t, r in zip(toks, rats):
                 if r == 1:
                     words.add(t)
