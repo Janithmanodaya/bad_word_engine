@@ -850,8 +850,9 @@ def main():
 
     # Model loading (small classifier only)
     model_kwargs = {"config": config}
+    # Use float32 weights for stable training and to avoid FP16 scaler issues
     if has_cuda:
-        model_kwargs.update(dict(torch_dtype=compute_dtype, device_map="auto"))
+        model_kwargs.update(dict(torch_dtype=torch.float32, device_map="auto"))
     else:
         model_kwargs.update(dict(torch_dtype=torch.float32))
 
@@ -940,6 +941,8 @@ def main():
         dataloader_pin_memory=True,
         auto_find_batch_size=True,
         group_by_length=True,
+        # Avoid gradient clipping interaction with FP16 scaler
+        max_grad_norm=0.0,
     )
     if eval_key:
         training_kwargs[eval_key] = "steps"
@@ -951,8 +954,9 @@ def main():
     if has_cuda:
         training_kwargs.update(
             dict(
+                # Prefer bf16 on Ampere+, otherwise disable fp16 to avoid GradScaler issues
                 bf16=(compute_dtype == torch.bfloat16),
-                fp16=(compute_dtype == torch.float16),
+                fp16=False,
             )
         )
 
