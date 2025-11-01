@@ -1,6 +1,7 @@
 import os
 import re
 import unicodedata
+import logging
 from typing import List, Set, Tuple
 from urllib.parse import urlparse
 
@@ -8,10 +9,25 @@ import requests
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+# Logging setup
+def _get_log_level() -> int:
+    lvl = os.getenv("LOG_LEVEL", "INFO").upper()
+    return getattr(logging, lvl, logging.INFO)
+
+
+logging.basicConfig(level=_get_log_level(), format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("badwords")
+
 # Globals for lexicons
 BAD_WORDS_EN: Set[str] = set()
 BAD_WORDS_SI: Set[str] = set()
 BAD_WORDS_SI_SINGLISH: Set[str] = set()
+
+
+def _preview(text: str, n: int = 160) -> str:
+    if len(text) <= n:
+        return text
+    return text[:n] + "...(truncated)"
 
 
 def normalize_text(text: str) -> str:
@@ -39,31 +55,39 @@ def deobfuscate(text: str) -> str:
         "9": "g",
         "|": "i",
     }
+    before = t
     t = "".join(subs.get(ch, ch) for ch in t)
     # Collapse repeated characters (3+ -> 2)
     t = re.sub(r"(.)\1{2,}", r"\1\1", t)
     # Strip diacritics for Latin
     t = "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c))
+    logger.debug("Deobfuscate: before='%s' after='%s'", _preview(before), _preview(t))
     return t
 
 
 def tokenize(text: str) -> Tuple[List[str], List[str]]:
     latin_tokens = re.findall(r"[A-Za-z']+", text)
     sinhala_tokens = re.findall(r"[\u0D80-\u0DFF]+", text)
+    logger.debug("Tokenize: latin=%d sinhala=%d", len(latin_tokens), len(sinhala_tokens))
     return latin_tokens, sinhala_tokens
 
 
 def fetch_text_lines(url: str, timeout: int = 15) -> List[str]:
+    logger.info("Downloading list from %s", url)
     try:
         r = requests.get(url, timeout=timeout)
         if r.status_code == 200 and r.text:
-            return [line.strip() for line in r.text.splitlines() if line.strip()]
-    except Exception:
-        pass
+            lines = [line.strip() for line in r.text.splitlines() if line.strip()]
+            logger.info("Fetched %d lines from %s", len(lines), url)
+            return lines
+        logger.warning("Non-200 response from %s: %s", url, r.status_code)
+    except Exception as e:
+        logger.warning("Failed to fetch %s: %s", url, e)
     return []
 
 
 def load_en_bad_words() -> Set[str]:
+    logger.info("Loading English bad words (LDNOOBW)...")
     urls = [
         "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master/en.txt",
         "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/main/en.txt",
@@ -74,10 +98,12 @@ def load_en_bad_words() -> Set[str]:
             words.add(w.lower())
         if words:
             break
+    logger.info("Loaded %d English bad words", len(words))
     return words
 
 
 def load_si_bad_words_mrmrvl() -> Tuple[Set[str], Set[str]]:
+    logger.info("Loading Sinhala MRVLS lists (unicode + singlish)...")
     candidates_unicode = [
         "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-unicode.txt",
         "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-unicode.txt",
@@ -105,6 +131,7 @@ def load_si_bad_words_mrmrvl() -> Tuple[Set[str], Set[str]]:
         if si_singlish:
             break
 
+    logger.info("Loaded Sinhala MRVLS: unicode=%d singlish=%d", len(si_unicode), len(si_singlish))
     return si_unicode, si_singlish
 
 
@@ -114,19 +141,25 @@ def load_si_bad_words_sold() -> Set[str]:
     Controlled by USE_SOLD env var (default: enabled).
     """
     if os.getenv("USE_SOLD", "1").lower() not in {"1", "true", "yes"}:
+        logger.info("USE_SOLD disabled; skipping SOLD load.")
         return set()
 
     words: Set[str] = set()
     try:
         from datasets import load_dataset  # type: ignore
-    except Exception:
+    except Exception as e:
+        logger.warning("datasets library not available: %s", e)
         return words
 
     try:
+        logger.info("Loading SOLD dataset from HuggingFace...")
         sold = load_dataset("sinhala-nlp/SOLD")
-    except Exception:
+        logger.info("Loaded SOLD splits: %s", list(sold.keys()))
+    except Exception as e:
+        logger.warning("Failed to load SOLD: %s", e)
         return words
 
+    added = 0
     for split_name in ["train", "test"]:
         split = sold.get(split_name)
         if split is None:
@@ -147,6 +180,8 @@ def load_si_bad_words_sold() -> Set[str]:
             for t, r in zip(toks, rats):
                 if r == 1:
                     words.add(t)
+                    added += 1
+    logger.info("Collected %d SOLD rationale tokens (%d unique)", added, len(words))
     return words
 
 
@@ -189,16 +224,21 @@ def _load_semisold_tokens(threshold: float = 0.8, top_tokens: int = 1000) -> Set
     Controlled by USE_SEMISOLD env var (default: disabled).
     """
     if os.getenv("USE_SEMISOLD", "0").lower() not in {"1", "true", "yes"}:
+        logger.info("USE_SEMISOLD disabled; skipping SemiSOLD mining.")
         return set()
 
     try:
         from datasets import load_dataset  # type: ignore
-    except Exception:
+    except Exception as e:
+        logger.warning("datasets library not available for SemiSOLD: %s", e)
         return set()
 
     try:
+        logger.info("Loading SemiSOLD dataset from HuggingFace...")
         ds = load_dataset("sinhala-nlp/SemiSOLD", split="train")
-    except Exception:
+        logger.info("Loaded SemiSOLD rows: %d", len(ds))
+    except Exception as e:
+        logger.warning("Failed to load SemiSOLD: %s", e)
         return set()
 
     # Identify numeric score columns dynamically (values typically in [0,1])
@@ -210,7 +250,9 @@ def _load_semisold_tokens(threshold: float = 0.8, top_tokens: int = 1000) -> Set
     if not score_cols:
         # fallback to known names
         score_cols = ["xlmr", "xlmt", "mbert", "sinbert", "lstm_ft", "cnn_ft", "lstm_cbow", "cnn_cbow", "lstm_sl", "cnn_sl", "svm"]
+    logger.info("SemiSOLD score columns detected: %s", score_cols)
 
+    kept_rows = 0
     # Collect tokens from high-score rows
     freq = {}
     for row in ds:
@@ -220,6 +262,7 @@ def _load_semisold_tokens(threshold: float = 0.8, top_tokens: int = 1000) -> Set
         mean_score = sum(scores) / len(scores)
         if mean_score < threshold:
             continue
+        kept_rows += 1
         text = normalize_text(str(row.get("text", "")))
         # Extract Sinhala tokens only
         _, si_tokens = tokenize(text)
@@ -227,12 +270,17 @@ def _load_semisold_tokens(threshold: float = 0.8, top_tokens: int = 1000) -> Set
             tok_n = unicodedata.normalize("NFKC", tok)
             freq[tok_n] = freq.get(tok_n, 0) + 1
 
+    logger.info("SemiSOLD rows kept after threshold %.2f: %d", threshold, kept_rows)
+
     # Take top tokens
     sorted_toks = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:top_tokens]
-    return {t for t, _ in sorted_toks}
+    result = {t for t, _ in sorted_toks}
+    logger.info("SemiSOLD harvested tokens selected: %d (top %d)", len(result), top_tokens)
+    return result
 
 
 def init_lexicons() -> None:
+    logger.info("Initializing lexicons...")
     global BAD_WORDS_EN, BAD_WORDS_SI, BAD_WORDS_SI_SINGLISH
     BAD_WORDS_EN = load_en_bad_words()
 
@@ -257,6 +305,15 @@ def init_lexicons() -> None:
     BAD_WORDS_SI.update(si_c)
     BAD_WORDS_SI_SINGLISH.update(si_sing_c)
 
+    logger.info(
+        "Lexicons ready: EN=%d SI=%d SI_singlish=%d (USE_SOLD=%s USE_SEMISOLD=%s)",
+        len(BAD_WORDS_EN),
+        len(BAD_WORDS_SI),
+        len(BAD_WORDS_SI_SINGLISH),
+        os.getenv("USE_SOLD", "1"),
+        os.getenv("USE_SEMISOLD", "0"),
+    )
+
 
 def check_api_key(req: Request, expected_key: str) -> None:
     key = req.headers.get("X-API-Key", "")
@@ -276,23 +333,28 @@ def find_bad_words(text: str) -> Set[str]:
     hits: Set[str] = set()
 
     variants = [normalize_text(text), deobfuscate(text)]
-    for t_norm in variants:
+    for idx, t_norm in enumerate(variants):
+        logger.debug("Variant %d preview='%s'", idx, _preview(t_norm))
         latin_tokens, sinhala_tokens = tokenize(t_norm)
 
+        exact_before = len(hits)
         for tok in latin_tokens:
             if tok in BAD_WORDS_EN or tok in BAD_WORDS_SI_SINGLISH:
                 hits.add(tok)
-
         for tok in sinhala_tokens:
             if tok in BAD_WORDS_SI:
                 hits.add(tok)
+        exact_after = len(hits)
 
-        # Sinhala substring fallback (captures suffixes/prefixes)
+        # Substring fallbacks
         hits.update(_match_substrings(t_norm, BAD_WORDS_SI, min_len=2))
-        # English/Singlish substring fallback (avoid short false-positives)
         hits.update(_match_substrings(t_norm, BAD_WORDS_EN, min_len=4))
         hits.update(_match_substrings(t_norm, BAD_WORDS_SI_SINGLISH, min_len=4))
 
+        logger.debug("Variant %d: exact_hits_added=%d total_hits=%d", idx, exact_after - exact_before, len(hits))
+
+    if hits:
+        logger.debug("Final hits: %s", sorted(hits, key=lambda s: (len(s), s))[:50])
     return hits
 
 
@@ -326,17 +388,21 @@ def health():
         "si_words": len(BAD_WORDS_SI),
         "si_singlish_words": len(BAD_WORDS_SI_SINGLISH),
         "use_sold": os.getenv("USE_SOLD", "1"),
-        "    }
+        "use_semisold": os.getenv("USE_SEMISOLD", "0"),
+    }
 
 
 @app.post("/check")
 async def check_default(req: Request, payload: CheckRequest):
     api_key = os.getenv("API_KEY", "")
     check_api_key(req, api_key)
+    logger.info("Incoming /check: advanced=%s text_preview='%s'", payload.advanced, _preview(payload.text))
     hits = find_bad_words(payload.text)
+    logger.info("Outgoing /check: found=%s hits=%d", bool(hits), len(hits))
     if payload.advanced:
         return AdvancedResponse(found=bool(hits), bad_words=sorted(hits, key=lambda s: (len(s), s)))
-    return DefaultResponse(found=bool(hits))
+    return DefaultResponse(found=bool(hi_codetsnew)</)
+
 
 
 def parse_host_port(url_str: str) -> Tuple[str, int]:
