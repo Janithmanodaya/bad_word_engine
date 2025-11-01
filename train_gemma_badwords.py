@@ -517,12 +517,22 @@ def build_dataset(path: str, text_col: str, label_col: str, seed: int, val_size:
     return ds
 
 
-def build_sold_dataset(seed: int, val_size: float, train_path: Optional[str] = None, test_path: Optional[str] = None, trial_path: Optional[str] = None) -> DatasetDict:
+def build_sold_dataset(
+    seed: int,
+    val_size: float,
+    train_path: Optional[str] = None,
+    test_path: Optional[str] = None,
+    trial_path: Optional[str] = None,
+    parquet_train_api: Optional[str] = None,
+    parquet_test_api: Optional[str] = None,
+) -> DatasetDict:
     """
     Load SOLD (Sinhala Offensive Language Dataset).
     Preferred: Hugging Face hub 'sinhala-nlp/SOLD'.
-    Fallback: local TSV files if hub load fails. Expects columns containing text and label.
-    Returns DatasetDict with 'train' and 'validation' splits.
+    Fallback order:
+      1) Remote parquet files obtained via Hugging Face API endpoints
+      2) Local TSV files
+    Returns DatasetDict with 'train' and 'validation' splits and normalized columns 'text'/'label'.
     """
     logging.info("[SOLD] Attempting to load 'sinhala-nlp/SOLD' from Hugging Face hub")
     ds: Optional[DatasetDict] = None
@@ -535,21 +545,54 @@ def build_sold_dataset(seed: int, val_size: float, train_path: Optional[str] = N
             elif "train" in raw and "validation" in raw:
                 ds = DatasetDict({"train": raw["train"], "validation": raw["validation"]})
             else:
-                # Single split present; create validation
                 base = list(raw.values())[0]
                 split = base.train_test_split(test_size=val_size, seed=seed)
                 ds = DatasetDict({"train": split["train"], "validation": split["test"]})
         else:
-            # Unexpected structure; make a split
             split = raw.train_test_split(test_size=val_size, seed=seed)
             ds = DatasetDict({"train": split["train"], "validation": split["test"]})
         logging.info("[SOLD] Hub dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
     except Exception as e:
-        logging.warning("[SOLD] Hub load failed: %s. Trying local TSV fallback.", e)
+        logging.warning("[SOLD] Hub load failed: %s. Trying remote parquet fallback.", e)
+
+    # Remote parquet fallback via API endpoints
+    def _fetch_parquet_urls(api_url: str) -> List[str]:
+        urls: List[str] = []
+        try:
+            with urllib.request.urlopen(api_url) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            # Expected structure: list of dicts with 'url' keys
+            # Some endpoints return dicts with 'parquet_files' or similar. Handle both.
+            if isinstance(data, dict):
+                items = data.get("parquet_files") or data.get("urls") or data.get("files") or []
+                if isinstance(items, list):
+                    for item in items:
+                        u = item.get("url") if isinstance(item, dict) else item
+                        if isinstance(u, str) and u:
+                            urls.append(u)
+            elif isinstance(data, list):
+                for item in data:
+                    u = item.get("url") if isinstance(item, dict) else item
+                    if isinstance(u, str) and u:
+                        urls.append(u)
+        except Exception as e:
+            logging.warning("[SOLD] Failed to fetch parquet URLs from API '%s': %s", api_url, e)
+        return urls
+
+    if ds is None and parquet_train_api and parquet_test_api:
+        train_urls = _fetch_parquet_urls(parquet_train_api)
+        test_urls = _fetch_parquet_urls(parquet_test_api)
+        if train_urls and test_urls:
+            try:
+                logging.info("[SOLD] Loading parquet from API URLs (train/test)")
+                raw = load_dataset("parquet", data_files={"train": train_urls, "validation": test_urls})
+                ds = DatasetDict({"train": raw["train"], "validation": raw["validation"]})
+                logging.info("[SOLD] Parquet dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
+            except Exception as e:
+                logging.warning("[SOLD] Parquet load failed: %s. Falling back to local TSV.", e)
 
     # Local TSV fallback
     if ds is None:
-        # Default paths if not provided
         train_p = train_path or "data/SOLD_train.tsv"
         test_p = test_path or "data/SOLD_test.tsv"
         trial_p = trial_path or "data/SOLD_trial.tsv"
@@ -564,9 +607,8 @@ def build_sold_dataset(seed: int, val_size: float, train_path: Optional[str] = N
 
         train_split = _maybe_load_tsv(train_p, "train")
         test_split = _maybe_load_tsv(test_p, "validation")  # map test to validation
-        trial_split = _maybe_load_tsv(trial_p, "trial")
+        _ = _maybe_load_tsv(trial_p, "trial")
 
-        # If test not present, create validation from train
         if train_split is None:
             raise FileNotFoundError("[SOLD] Local TSV fallback failed: training file not found.")
         if test_split is None:
@@ -576,25 +618,24 @@ def build_sold_dataset(seed: int, val_size: float, train_path: Optional[str] = N
         else:
             ds = DatasetDict({"train": train_split, "validation": test_split})
 
-        # Heuristically select text/label columns if not exactly 'text' and 'label'
-        def _guess_columns(column_names: List[str]) -> (str, str):
-            text_candidates = ["text", "comment", "sentence", "content"]
-            label_candidates = ["label", "labels", "gold_label", "class", "target"]
-            text_col = next((c for c in text_candidates if c in column_names), None)
-            label_col = next((c for c in label_candidates if c in column_names), None)
-            if not text_col or not label_col:
-                raise ValueError(f"[SOLD] Could not infer text/label columns from: {column_names}")
-            return text_col, label_col
-
-        # Normalize to expected columns names
-        tcol_train, lcol_train = _guess_columns(ds["train"].column_names)
-        tcol_val, lcol_val = _guess_columns(ds["validation"].column_names)
-        if tcol_train != "text" or lcol_train != "label":
-            ds = ds.rename_column(tcol_train, "text").rename_column(lcol_train, "label")
-        if tcol_val != "text" or lcol_val != "label":
-            ds = ds.rename_column(tcol_val, "text").rename_column(lcol_val, "label")
-
         logging.info("[SOLD] Local TSV dataset loaded. train=%d, validation=%d", len(ds["train"]), len(ds["validation"]))
+
+    # Normalize columns to 'text' and 'label' if needed
+    def _guess_columns(column_names: List[str]) -> (str, str):
+        text_candidates = ["text", "comment", "sentence", "content"]
+        label_candidates = ["label", "labels", "gold_label", "class", "target"]
+        text_col = next((c for c in text_candidates if c in column_names), None)
+        label_col = next((c for c in label_candidates if c in column_names), None)
+        if not text_col or not label_col:
+            raise ValueError(f"[SOLD] Could not infer text/label columns from: {column_names}")
+        return text_col, label_col
+
+    tcol_train, lcol_train = _guess_columns(ds["train"].column_names)
+    tcol_val, lcol_val = _guess_columns(ds["validation"].column_names)
+    if tcol_train != "text" or lcol_train != "label":
+        ds = ds.rename_column(tcol_train, "text").rename_column(lcol_train, "label")
+    if tcol_val != "text" or lcol_val != "label":
+        ds = ds.rename_column(tcol_val, "text").rename_column(lcol_val, "label")
 
     # Final confirmation
     for col in ("text", "label"):
@@ -659,7 +700,11 @@ def main():
     parser.add_argument("--colab_keepalive", action="store_true", help="Enable a lightweight keepalive thread to reduce Colab idle disconnects.")
     parser.add_argument("--colab_keepalive_interval", type=int, default=60, help="Keepalive ping interval in seconds (default: 60).")
     # Use SOLD dataset
-    parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub. If hub load fails, fallback to local TSV files.")
+    parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub. If hub load fails, fallback to remote parquet or local TSV files.")
+    # Remote parquet API endpoints (used if hub fails)
+    parser.add_argument("--sold_parquet_train_api", type=str, default="https://huggingface.co/api/datasets/sinhala-nlp/SOLD/parquet/default/train", help="API endpoint to fetch parquet URLs for SOLD train split.")
+    parser.add_argument("--sold_parquet_test_api", type=str, default="https://huggingface.co/api/datasets/sinhala-nlp/SOLD/parquet/default/test", help="API endpoint to fetch parquet URLs for SOLD test split.")
+    # Local TSV fallback
     parser.add_argument("--sold_train_path", type=str, default="data/SOLD_train.tsv", help="Local path to SOLD train TSV (fallback).")
     parser.add_argument("--sold_test_path", type=str, default="data/SOLD_test.tsv", help="Local path to SOLD test TSV as validation (fallback).")
     parser.add_argument("--sold_trial_path", type=str, default="data/SOLD_trial.tsv", help="Local path to SOLD trial TSV (optional, unused for training).")
@@ -863,13 +908,15 @@ def main():
             train_path=args.sold_train_path,
             test_path=args.sold_test_path,
             trial_path=args.sold_trial_path,
+            parquet_train_api=args.sold_parquet_train_api,
+            parquet_test_api=args.sold_parquet_test_api,
         )
         # Normalize expected columns
         args.text_column = "text"
         args.label_column = "label"
         logging.info("[SOLD] Using columns text='%s', label='%s'", args.text_column, args.label_column)
     else:
-        ds = build_dataset(dataset_path, args.text_column, args.label_column, seed=args.seed, val_size=args.val_size)
+       )
     ds = ensure_label_ints(ds, args.label_column)
     # Log dataset stats
     try:
