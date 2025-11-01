@@ -156,6 +156,17 @@ from huggingface_hub import login as hf_login
 from huggingface_hub.errors import GatedRepoError
 
 # ---------------------------
+# Torch perf knobs (use max available resources)
+# ---------------------------
+try:
+    import torch.backends.cudnn as cudnn  # type: ignore
+    cudnn.benchmark = True
+except Exception:
+    pass
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True  # Ampere+
+
+# ---------------------------
 # Wordlist utilities
 # ---------------------------
 
@@ -834,7 +845,7 @@ def main():
     # Model loading (small classifier only)
     model_kwargs = {"config": config}
     if has_cuda:
-        model_kwargs.update(dict(torch_dtype=compute_dtype, device_map={"": 0} if torch.cuda.device_count() >= 1 else "auto"))
+        model_kwargs.update(dict(torch_dtype=compute_dtype, device_map="auto"))
     else:
         model_kwargs.update(dict(torch_dtype=torch.float32))
 
@@ -918,6 +929,11 @@ def main():
         greater_is_better=True,
         push_to_hub=args.push_to_hub,
         hub_model_id=args.hub_model_id,
+        # Max resource utilization for dataloading
+        dataloader_num_workers=max(1, (os.cpu_count() or 1) // 2),
+        dataloader_pin_memory=True,
+        auto_find_batch_size=True,
+        group_by_length=True,
     )
     if eval_key:
         training_kwargs[eval_key] = "steps"
