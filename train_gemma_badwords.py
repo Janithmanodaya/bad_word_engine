@@ -36,6 +36,7 @@ from typing import Optional, List
 import shutil
 import time
 import logging
+from collections import defaultdict
 
 # ---------------------------
 # Colab detection
@@ -167,41 +168,107 @@ from huggingface_hub.errors import GatedRepoError
 DEFAULT_BADWORDS_REPO = "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master"
 DEFAULT_CLEANWORDS_URL = "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt"
 
+# Simple download event log for clear PASS/FAIL reporting
+DOWNLOAD_EVENTS: List[dict] = []
+
+def _record_download(stage: str, url: str, ok: bool, count: int = 0, error: str = "") -> None:
+    DOWNLOAD_EVENTS.append({
+        "stage": stage,
+        "url": url,
+        "ok": bool(ok),
+        "count": int(count) if count else 0,
+        "error": error,
+    })
+
+def _summarize_downloads() -> None:
+    if not DOWNLOAD_EVENTS:
+        return
+    logging.info("=" * 70)
+    logging.info("Download summary (PASS/FAIL):")
+    by_stage: dict = defaultdict(list)
+    for ev in DOWNLOAD_EVENTS:
+        by_stage[ev["stage"]].append(ev)
+    for stage in sorted(by_stage.keys()):
+        stage_events = by_stage[stage]
+        ok_n = sum(1 for e in stage_events if e["ok"])
+        fail_n = sum(1 for e in stage_events if not e["ok"])
+        logging.info(f"- {stage}: {ok_n} OK, {fail_n} FAIL")
+        for e in stage_events:
+            status = "OK" if e["ok"] else "FAIL"
+            extra = f" (lines={e['count']})" if e["ok"] else f" (error={e['error']})"
+            logging.info(f"  [{status}] {e['url']}{extra}")
+    logging.info("=" * 70)
+
 def download_bad_words(langs: List[str], repo_base: str = DEFAULT_BADWORDS_REPO) -> List[str]:
-    bad = []
-    alt_sources = {
-        # Try alternative sources per language if LDNOOBW lacks it
-        "si": [
-            # Add more known sources here if available publicly
-            # Example mirrors or community lists (may or may not exist at runtime)
-            "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master/si",  # original attempt
-            "https://raw.githubusercontent.com/zoomination/multilingual-profanity/main/lists/si.txt",
-            "https://raw.githubusercontent.com/zoomination/multilingual-profanity/master/lists/si.txt",
-        ],
-        "en": [
-            f"{repo_base}/en",
-        ],
-    }
+    """
+    Download bad words for the given language codes.
+    - For 'en': use LDNOOBW (try both with/without .txt).
+    - For 'si': LDNOOBW doesn't host Sinhala; pull from MRVLS unicode + singlish lists and known mirrors.
+    """
+    bad: List[str] = []
+
+    def _fetch_lines(stage: str, url: str) -> List[str]:
+        try:
+            with urllib.request.urlopen(url) as r:
+                lines = [
+                    line.strip()
+                    for line in r.read().decode("utf-8", errors="ignore").splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+                _record_download(stage, url, ok=True, count=len(lines))
+                return lines
+        except Exception as e:
+            _record_download(stage, url, ok=False, error=str(e))
+            logging.warning(f"[wordlist] Failed to download {url}: {e}")
+            return []
+
     for lang in langs:
-        tried = False
-        # Primary URL pattern
-        primary_url = f"{repo_base}/{lang.strip()}"
-        for url in [primary_url] + alt_sources.get(lang.strip(), []):
-            if tried and url == primary_url:
-                continue
-            tried = True
-            try:
-                logging.info(f"[wordlist] Downloading bad words for '{lang}' from {url}")
-                with urllib.request.urlopen(url) as r:
-                    for line in r.read().decode("utf-8", errors="ignore").splitlines():
-                        w = line.strip()
-                        if not w or w.startswith("#"):
-                            continue
-                        bad.append(w)
-                break  # success for this lang
-            except Exception as e:
-                logging.warning(f"[wordlist] Failed to download {url}: {e}")
-                continue
+        lang = lang.strip().lower()
+        if not lang:
+            continue
+
+        if lang == "si":
+            # Primary sources: MRVLS Sinhala lists (unicode + singlish)
+            candidates = [
+                # Unicode Sinhala bad words
+                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-unicode.txt",
+                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-unicode.txt",
+                # Singlish transliteration
+                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-singlish.txt",
+                "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-singlish.txt",
+            ]
+            got_any = False
+            for u in candidates:
+                lines = _fetch_lines("badwords:si", u)
+                if lines:
+                    bad.extend(lines)
+                    got_any = True
+            if not got_any:
+                logging.warning("[wordlist] No Sinhala lists were fetched; will rely on built-in minimal set later.")
+            continue
+
+        # English and other languages via LDNOOBW
+        if lang == "en":
+            candidates = [
+                f"{repo_base}/en",
+                f"{repo_base}/en.txt",
+                repo_base.replace("master", "main") + "/en",
+                repo_base.replace("master", "main") + "/en.txt",
+            ]
+        else:
+            candidates = [
+                f"{repo_base}/{lang}",
+                f"{repo_base}/{lang}.txt",
+                repo_base.replace("master", "main") + f"/{lang}",
+                repo_base.replace("master", "main") + f"/{lang}.txt",
+            ]
+
+        for url in candidates:
+            lines = _fetch_lines(f"badwords:{lang}", url)
+            if lines:
+                bad.extend(lines)
+                break
+
     # Deduplicate, keep order
     seen = set()
     uniq = []
@@ -218,13 +285,16 @@ def download_clean_words(url: str = DEFAULT_CLEANWORDS_URL, limit: int = 10000) 
     try:
         logging.info(f"[wordlist] Downloading clean words from {url}")
         with urllib.request.urlopen(url) as r:
-            for i, line in enumerate(r.read().decode("utf-8", errors="ignore").splitlines()):
+            lines = r.read().decode("utf-8", errors="ignore").splitlines()
+            _record_download("cleanwords", url, ok=True, count=len(lines))
+            for i, line in enumerate(lines):
                 if not line:
                     continue
                 clean.append(line.strip().lower())
                 if limit and len(clean) >= limit:
                     break
     except Exception as e:
+        _record_download("cleanwords", url, ok=False, error=str(e))
         logging.warning(f"[wordlist] Failed to download clean words: {e}")
     logging.info(f"[wordlist] Total clean words collected: {len(clean)}")
     return clean
@@ -363,11 +433,27 @@ def build_dataset(path: str, text_col: str, label_col: str, seed: int, val_size:
 
     # If no explicit validation, make a split
     if "validation" not in ds:
-        split = ds["train"].train_test_split(
-            test_size=val_size,
-            seed=seed,
-            stratify_by_column=label_col if label_col in ds["train"].column_names else None,
-        )
+        # Use stratification only if the label column is a ClassLabel feature
+        stratify = None
+        try:
+            feat = ds["train"].features.get(label_col, None)
+            # Avoid importing ClassLabel directly to keep dependencies light; check by class name
+            if feat is not None and feat.__class__.__name__ == "ClassLabel":
+                stratify = label_col
+        except Exception:
+            stratify = None
+
+        if stratify:
+            split = ds["train"].train_test_split(
+                test_size=val_size,
+                seed=seed,
+                stratify_by_column=stratify,
+            )
+        else:
+            split = ds["train"].train_test_split(
+                test_size=val_size,
+                seed=seed,
+            )
         ds = DatasetDict(train=split["train"], validation=split["test"])
 
     # Ensure required columns exist
@@ -420,6 +506,11 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory.")
     parser.add_argument("--preset", type=str, choices=["base", "low_vram"], default="low_vram", help="Convenience presets for VRAM.")
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
+    # GPU preference/validation
+    parser.add_argument("--require_gpu_name", type=str, default="", help="If set, require that CUDA device name contains this substring (e.g., 'T4').")
+    parser.add_argument("--enforce_gpu_name", action="store_true", help="If true and require_gpu_name set, exit if the CUDA device name doesn't match.")
+    # Fresh start / cache clearing
+    parser.add_argument("--fresh_start", action="store_true", help="Delete output_dir and model/dataset caches before starting.")
     # Auth and fallback
     parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"), help="Hugging Face token for gated models.")
     parser.add_argument("--fallback_model", type=str, default="Qwen/Qwen2-1.5B-Instruct", help="Fallback open model if base model is gated and no token.")
@@ -434,9 +525,39 @@ def main():
         os.environ.setdefault("TRANSFORMERS_CACHE", "/content/cache/transformers")
         os.environ.setdefault("DATASETS_CACHE", "/content/cache/datasets")
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+    # Fresh start: remove output and caches
+    if args.fresh_start:
+        print("[fresh_start] Deleting previous outputs and caches...")
+        paths_to_clear = [args.output_dir]
+        for env_key in ("HF_HOME", "TRANSFORMERS_CACHE", "DATASETS_CACHE"):
+            p = os.environ.get(env_key, "")
+            if p:
+                paths_to_clear.append(p)
+        # In user envs, also consider default HF cache if env not set
+        default_hf_cache = os.path.expanduser("~/.cache/huggingface")
+        default_ds_cache = os.path.expanduser("~/.cache/huggingface/datasets")
+        default_tf_cache = os.path.expanduser("~/.cache/huggingface/transformers")
+        for p in [default_hf_cache, default_ds_cache, default_tf_cache]:
+            if p:
+                paths_to_clear.append(p)
+        for p in paths_to_clear:
+            try:
+                if p and os.path.exists(p):
+                    print(f"[fresh_start] Removing {p}")
+                    import shutil as _shutil
+                    _shutil.rmtree(p, ignore_errors=True)
+            except Exception as e:
+                print(f"[fresh_start] Warning: failed to remove {p}: {e}")
+        # Force rebuild of auto wordlist dataset if used
+        args.regenerate_wordlist = True
+
+    # Ensure directories exist after optional clearing
+    if in_colab():
         os.makedirs(os.environ["HF_HOME"], exist_ok=True)
         os.makedirs(os.environ["TRANSFORMERS_CACHE"], exist_ok=True)
         os.makedirs(os.environ["DATASETS_CACHE"], exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     log_path = os.path.join(args.output_dir, "train.log")
     logging.basicConfig(
@@ -488,11 +609,31 @@ def main():
     logging.info(f"CUDA available: {has_cuda}")
     if has_cuda:
         try:
-            logging.info(f"CUDA device count: {torch.cuda.device_count()}")
-            logging.info(f"CUDA device: {torch.cuda.get_device_name(0)}")
-        except Exception:
-            pass
+            ndev = torch.cuda.device_count()
+            torch.cuda.set_device(0)
+            dev_name = torch.cuda.get_device_name(0)
+            logging.info(f"CUDA device count: {ndev}")
+            logging.info(f"Using CUDA device 0: {dev_name}")
+            # Enforce/validate GPU name if requested
+            if args.require_gpu_name:
+                if args.require_gpu_name.lower() not in dev_name.lower():
+                    msg = f"Detected GPU '{dev_name}' does not match required pattern '{args.require_gpu_name}'."
+                    if args.enforce_gpu_name:
+                        raise SystemExit(msg + " Exiting due to --enforce_gpu_name.")
+                    else:
+                        logging.warning(msg + " Continuing anyway.")
+            else:
+                # In Colab, hint if not a T4
+                if in_colab() and "t4" not in dev_name.lower():
+                    logging.warning("Colab GPU is '%s', not T4. If you require T4, set --require_gpu_name T4.", dev_name)
+        except Exception as e:
+            logging.warning(f"Failed to finalize CUDA device selection/logging: {e}")
     if not has_cuda and not args.force_cpu:
+        if in_colab():
+            raise SystemExit(
+                "No CUDA GPU detected. In Google Colab, enable GPU via: Runtime > Change runtime type > Hardware accelerator > GPU.\n"
+                "If you still want to attempt CPU training (not recommended; may OOM), pass --force_cpu."
+            )
         raise SystemExit(
             "No CUDA GPU detected. QLoRA with bitsandbytes requires an NVIDIA GPU. "
             "If you still want to attempt CPU training (not recommended; may OOM), pass --force_cpu."
@@ -515,10 +656,15 @@ def main():
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
         active_model_id = args.base_model
-    except GatedRepoError as ge:
-        logging.warning(f"Base model gated and not accessible: {ge}. Falling back to {args.fallback_model}")
-        tokenizer = AutoTokenizer.from_pretrained(args.fallback_model, use_fast=True)
-        active_model_id = args.fallback_model
+    except Exception as e:
+        # Some environments raise OSError instead of GatedRepoError for gated repos
+        msg = str(e).lower()
+        if isinstance(e, GatedRepoError) or "gated repo" in msg or "401" in msg or "unauthorized" in msg:
+            logging.warning(f"Base model not accessible ({e}). Falling back to {args.fallback_model}")
+            tokenizer = AutoTokenizer.from_pretrained(args.fallback_model, use_fast=True)
+            active_model_id = args.fallback_model
+        else:
+            raise
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -538,7 +684,22 @@ def main():
         logging.warning(f"Failed to log dataset stats: {e}")
 
     def tokenize_fn(batch):
-        toks = tokenizer(batch[args.text_column], max_length=args.max_length, truncation=True)
+        # Normalize inputs for tokenizer: ensure list of strings
+        texts = batch.get(args.text_column)
+        if not isinstance(texts, list):
+            texts = [texts]
+        safe_texts = []
+        for t in texts:
+            if t is None:
+                safe_texts.append("")
+            elif isinstance(t, str):
+                safe_texts.append(t)
+            else:
+                try:
+                    safe_texts.append(str(t))
+                except Exception:
+                    safe_texts.append("")
+        toks = tokenizer(safe_texts, max_length=args.max_length, truncation=True)
         toks["labels"] = batch[args.label_column]
         return toks
 
@@ -562,11 +723,13 @@ def main():
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=compute_dtype,
         )
+        # Prefer binding entirely to GPU 0 when available
+        device_map = {"": 0} if torch.cuda.device_count() >= 1 else "auto"
         model_kwargs.update(
             dict(
                 quantization_config=bnb_config,
                 torch_dtype=compute_dtype,
-                device_map="auto",
+                device_map=device_map,
             )
         )
     else:
@@ -576,9 +739,11 @@ def main():
     logging.info(f"Loading base model: {active_model_id}")
     try:
         model = AutoModelForSequenceClassification.from_pretrained(active_model_id, **model_kwargs)
-    except GatedRepoError as ge:
-        if active_model_id != args.fallback_model:
-            logging.warning(f"Model gated and not accessible: {ge}. Falling back to {args.fallback_model}")
+    except Exception as e:
+        msg = str(e).lower()
+        is_gated = isinstance(e, GatedRepoError) or "gated repo" in msg or "401" in msg or "unauthorized" in msg
+        if is_gated and active_model_id != args.fallback_model:
+            logging.warning(f"Model not accessible ({e}). Falling back to {args.fallback_model}")
             active_model_id = args.fallback_model
             config = AutoConfig.from_pretrained(active_model_id, num_labels=num_labels)
             model_kwargs["config"] = config
@@ -641,6 +806,17 @@ def main():
         }
 
     # Training args
+    # Transformers v5 renamed 'evaluation_strategy' -> 'eval_strategy'.
+    try:
+        from transformers import __version__ as _tfv
+    except Exception:
+        _tfv = "0.0.0"
+    try:
+        major_ver = int(_tfv.split(".")[0])
+    except Exception:
+        major_ver = 4
+    eval_key = "eval_strategy" if major_ver >= 5 else "evaluation_strategy"
+
     training_kwargs = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
@@ -651,8 +827,6 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         warmup_ratio=args.warmup_ratio,
         logging_steps=args.logging_steps,
-        evaluation_strategy="steps",
-        eval_steps=args.eval_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
         report_to="none",
@@ -662,6 +836,9 @@ def main():
         push_to_hub=args.push_to_hub,
         hub_model_id=args.hub_model_id,
     )
+    training_kwargs[eval_key] = "steps"
+    training_kwargs["eval_steps"] = args.eval_steps
+
     if has_cuda:
         training_kwargs.update(
             dict(
