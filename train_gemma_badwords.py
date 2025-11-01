@@ -471,6 +471,8 @@ def main():
     # GPU preference/validation
     parser.add_argument("--require_gpu_name", type=str, default="", help="If set, require that CUDA device name contains this substring (e.g., 'T4').")
     parser.add_argument("--enforce_gpu_name", action="store_true", help="If true and require_gpu_name set, exit if the CUDA device name doesn't match.")
+    # Fresh start / cache clearing
+    parser.add_argument("--fresh_start", action="store_true", help="Delete output_dir and model/dataset caches before starting.")
     # Auth and fallback
     parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"), help="Hugging Face token for gated models.")
     parser.add_argument("--fallback_model", type=str, default="Qwen/Qwen2-1.5B-Instruct", help="Fallback open model if base model is gated and no token.")
@@ -485,9 +487,39 @@ def main():
         os.environ.setdefault("TRANSFORMERS_CACHE", "/content/cache/transformers")
         os.environ.setdefault("DATASETS_CACHE", "/content/cache/datasets")
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+    # Fresh start: remove output and caches
+    if args.fresh_start:
+        print("[fresh_start] Deleting previous outputs and caches...")
+        paths_to_clear = [args.output_dir]
+        for env_key in ("HF_HOME", "TRANSFORMERS_CACHE", "DATASETS_CACHE"):
+            p = os.environ.get(env_key, "")
+            if p:
+                paths_to_clear.append(p)
+        # In user envs, also consider default HF cache if env not set
+        default_hf_cache = os.path.expanduser("~/.cache/huggingface")
+        default_ds_cache = os.path.expanduser("~/.cache/huggingface/datasets")
+        default_tf_cache = os.path.expanduser("~/.cache/huggingface/transformers")
+        for p in [default_hf_cache, default_ds_cache, default_tf_cache]:
+            if p:
+                paths_to_clear.append(p)
+        for p in paths_to_clear:
+            try:
+                if p and os.path.exists(p):
+                    print(f"[fresh_start] Removing {p}")
+                    import shutil as _shutil
+                    _shutil.rmtree(p, ignore_errors=True)
+            except Exception as e:
+                print(f"[fresh_start] Warning: failed to remove {p}: {e}")
+        # Force rebuild of auto wordlist dataset if used
+        args.regenerate_wordlist = True
+
+    # Ensure directories exist after optional clearing
+    if in_colab():
         os.makedirs(os.environ["HF_HOME"], exist_ok=True)
         os.makedirs(os.environ["TRANSFORMERS_CACHE"], exist_ok=True)
         os.makedirs(os.environ["DATASETS_CACHE"], exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     log_path = os.path.join(args.output_dir, "train.log")
     logging.basicConfig(
