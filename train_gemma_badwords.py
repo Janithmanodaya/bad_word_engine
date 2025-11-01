@@ -56,10 +56,8 @@ def in_colab() -> bool:
 
 REQUIRED_PKGS = [
     "numpy",
-    # Transformers/PEFT stack
+    # Transformers stack (small classifier only)
     "transformers>=4.43",
-    "peft",
-    "bitsandbytes",
     "datasets",
     "accelerate",
     "evaluate",
@@ -146,7 +144,6 @@ from transformers import (
     AutoTokenizer,
     AutoConfig,
     AutoModelForSequenceClassification,
-    BitsAndBytesConfig,
     DataCollatorWithPadding,
     Trainer,
     TrainingArguments,
@@ -155,12 +152,6 @@ from transformers import (
 )
 from transformers.utils import logging as hf_logging
 from transformers.trainer_utils import get_last_checkpoint
-from peft import (
-    LoraConfig,
-    TaskType,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-)
 from huggingface_hub import login as hf_login
 from huggingface_hub.errors import GatedRepoError
 
@@ -542,7 +533,7 @@ def build_sold_dataset(seed: int, val_size: float) -> DatasetDict:
 # ---------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Self-installing QLoRA trainer for Gemma bad-word classification.")
+    parser = argparse.ArgumentParser(description="Self-installing trainer for compact bad-word classifier (Multilingual MiniLM).")
     parser.add_argument("--dataset_path", type=str, default="data/auto_badwords_en_si.csv", help="Path to CSV/JSON/JSONL with text+label columns.")
     parser.add_argument("--dataset_url", type=str, default=None, help="Optional URL to download dataset if dataset_path is missing.")
     # Auto wordlist options
@@ -556,7 +547,7 @@ def main():
     # Training/data params
     parser.add_argument("--text_column", type=str, default="text", help="Name of the text column.")
     parser.add_argument("--label_column", type=str, default="label", help="Name of the label column (0/1).")
-    parser.add_argument("--base_model", type=str, default="google/gemma-2-2b-it", help="Base Gemma model to fine-tune.")
+    parser.add_argument("--base_model", type=str, default="microsoft/Multilingual-MiniLM-L12-H384", help="Small classifier base model to fine-tune.")
     parser.add_argument("--output_dir", type=str, default="outputs/gemma-badwords-qlora", help="Where to save LoRA adapter and tokenizer.")
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--num_train_epochs", type=int, default=2)
@@ -568,9 +559,7 @@ def main():
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val_size", type=float, default=0.1)
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    
     parser.add_argument("--save_total_limit", type=int, default=3)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--eval_steps", type=int, default=50)
@@ -578,7 +567,7 @@ def main():
     parser.add_argument("--push_to_hub", action="store_true")
     parser.add_argument("--hub_model_id", type=str, default=None)
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory.")
-    parser.add_argument("--preset", type=str, choices=["base", "low_vram", "t4_fast", "small_cls"], default="low_vram", help="Convenience presets for VRAM or small classifier.")
+    parser.add_argument("--preset", type=str, choices=["small_cls"], default="small_cls", help="Use compact classifier model (no LoRA/4-bit).")
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU mode (discouraged; Gemma likely OOM on CPU).")
     # GPU preference/validation
     parser.add_argument("--require_gpu_name", type=str, default="", help="If set, require that CUDA device name contains this substring (e.g., 'T4').")
@@ -654,15 +643,11 @@ def main():
     hf_logging.set_verbosity_info()
     hf_logging.enable_default_handler()
     hf_logging.enable_explicit_format()
-    logging.info("Starting Gemma bad-words training")
+    logging.info("Starting bad-words classifier training")
     logging.info(f"Args: {vars(args)}")
 
-    # Decide if we are using a small classifier model (no LoRA/4-bit)
-    SMALL_MODEL_IDS = {
-        "microsoft/Multilingual-MiniLM-L12-H384",
-        "prajjwal1/bert-tiny",
-    }
-    small_model = (args.preset == "small_cls") or (args.base_model in SMALL_MODEL_IDS)
+    # Small classifier mode only (no LoRA/4-bit)
+    small_model = True
 
     # ---------------------------
     # Colab keepalive thread
@@ -690,50 +675,19 @@ def main():
         except Exception as e:
             logging.warning("[colab] Failed to start keepalive thread: %s", e)
 
-    # Apply presets
-    if args.preset == "low_vram" or in_colab():
-        # Lower memory footprint settings
-        if not args.gradient_accumulation_steps or args.gradient_accumulation_steps < 16:
-            args.gradient_accumulation_steps = 16
-        args.per_device_train_batch_size = 1
-        args.per_device_eval_batch_size = 1
-        args.max_length = min(args.max_length, 128)
-        args.gradient_checkpointing = True
-        # Logging/eval cadence better for Colab
-        args.logging_steps = min(args.logging_steps, 5)
-        args.eval_steps = max(args.eval_steps, 100)
-        args.save_steps = max(args.save_steps, 1000)
-        # Slightly lower LR can stabilize with high accumulation
-        args.learning_rate = min(args.learning_rate, 2e-4)
-    if args.preset == "t4_fast":
-        # A faster preset tuned for T4 on Colab: shorter sequences, less checkpoint/eval overhead,
-        # and reduced accumulation to progress steps faster (may use a bit more VRAM).
-        args.per_device_train_batch_size = 1
-        args.per_device_eval_batch_size = 1
-        args.max_length = min(args.max_length, 64)
-        # Reduce accumulation to progress global steps faster
-        args.gradient_accumulation_steps = max(8, int(args.gradient_accumulation_steps or 8))
-        # Disable gradient checkpointing for speed (T4 16GB should handle 2B 4-bit + LoRA at seq 64)
-        args.gradient_checkpointing = False
-        # Make logging/eval/save less frequent to reduce overhead
-        args.logging_steps = max(args.logging_steps, 50)
-        args.eval_steps = max(args.eval_steps, 500)
-        args.save_steps = max(args.save_steps, 2000)
-        # Keep LR as specified or capped
-        args.learning_rate = min(args.learning_rate, 2e-4)
-    if args.preset == "small_cls":
-        # Small classifier preset (no LoRA/4-bit quantization). Good for multilingual toxicity.
-        if args.base_model == "google/gemma-2-2b-it":
-            args.base_model = "microsoft/Multilingual-MiniLM-L12-H384"
-        args.per_device_train_batch_size = max(8, int(args.per_device_train_batch_size or 8))
-        args.per_device_eval_batch_size = max(32, int(args.per_device_eval_batch_size or 32))
-        args.max_length = min(args.max_length, 64)
-        args.gradient_accumulation_steps = max(1, int(args.gradient_accumulation_steps or 1))
-        args.gradient_checkpointing = False
-        args.logging_steps = max(args.logging_steps, 20)
-        args.eval_steps = max(args.eval_steps, 200)
-        args.save_steps = max(args.save_steps, 1000)
-        args.learning_rate = min(args.learning_rate, 5e-4)
+    # Apply preset for small classifier (no LoRA/4-bit quantization)
+    # Good for multilingual toxicity. Defaults chosen for speed and stability.
+    if args.base_model == "google/gemma-2-2b-it":
+        args.base_model = "microsoft/Multilingual-MiniLM-L12-H384"
+    args.per_device_train_batch_size = max(8, int(args.per_device_train_batch_size or 8))
+    args.per_device_eval_batch_size = max(32, int(args.per_device_eval_batch_size or 32))
+    args.max_length = min(args.max_length, 64)
+    args.gradient_accumulation_steps = max(1, int(args.gradient_accumulation_steps or 1))
+    args.gradient_checkpointing = False
+    args.logging_steps = max(args.logging_steps, 20)
+    args.eval_steps = max(args.eval_steps, 200)
+    args.save_steps = max(args.save_steps, 1000)
+    args.learning_rate = min(args.learning_rate, 5e-4)
 
     # Build dataset from wordlists if requested (skip when using SOLD)
     dataset_path = args.dataset_path
@@ -785,8 +739,8 @@ def main():
                 "If you still want to attempt CPU training (not recommended; may OOM), pass --force_cpu."
             )
         raise SystemExit(
-            "No CUDA GPU detected. QLoRA with bitsandbytes requires an NVIDIA GPU. "
-            "If you still want to attempt CPU training (not recommended; may OOM), pass --force_cpu."
+            "No CUDA GPU detected. A GPU is strongly recommended for training speed. "
+            "If you still want to attempt CPU training (may be slow), pass --force_cpu."
         )
 
     set_seed(args.seed)
@@ -877,12 +831,12 @@ def main():
         num_labels = 2
     config = AutoConfig.from_pretrained(active_model_id, num_labels=num_labels)
 
-    # Model loading (GPU QLoRA vs CPU)
+    # Model loading (small classifier only)
     model_kwargs = {"config": config}
-    if small_model:
-        # No 4-bit quantization or PEFT for small classifier models
-        if has_cuda:
-            model_kwargs.update(dict(torch_dtype=compute_dtype, device_map={"": 0} if torch.cuda.device_count() >= 1 else "auto"))
+    if has_cuda:
+        model_kwargs.update(dict(torch_dtype=compute_dtype, device_map={"": 0} if torch.cuda.device_count() >= 1 else "auto"))
+    else:
+        model_kwargs.update(dict(torch_dtype=torch.float_code >= 1 else "auto"))
         else:
             model_kwargs.update(dict(torch_dtype=torch.float32))
     else:
@@ -1028,18 +982,8 @@ def main():
         training_kwargs[eval_key] = "steps"
     training_kwargs["eval_steps"] = args.eval_steps
 
-    # If TrainingArguments supports gradient_checkpointing_kwargs, pass use_reentrant=False
-    try:
-        _params = inspect.signature(TrainingArguments.__init__).parameters
-        if "gradient_checkpointing_kwargs" in _params and args.gradient_checkpointing:
-            training_kwargs["gradient_checkpointing"] = True
-            training_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
-            logging.info("TrainingArguments configured with gradient_checkpointing_kwargs={'use_reentrant': False}.")
-        else:
-            # Maintain user preference if flag set but kwargs not supported
-            training_kwargs["gradient_checkpointing"] = bool(args.gradient_checkpointing)
-    except Exception:
-        training_kwargs["gradient_checkpointing"] = bool(args.gradient_checkpointing)
+    # Explicitly disable gradient checkpointing for small classifier
+    training_kwargs["gradient_checkpointing"] = False
 
     if has_cuda:
         training_kwargs.update(
@@ -1128,26 +1072,26 @@ def main():
     except Exception:
         pass
 
-    # Save adapter and tokenizer only (small)
+    # Save model and tokenizer
     os.makedirs(args.output_dir, exist_ok=True)
-    logging.info("Saving adapter and tokenizer...")
+    logging.info("Saving model and tokenizer...")
     trainer.model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
     # Export minimal inference card
     card = {
         "base_model": active_model_id,
-        "adapter_path": args.output_dir,
+        "model_path": args.output_dir,
         "task": "sequence-classification",
         "labels": list(range(num_labels)),
         "text_column": args.text_column,
         "label_column": args.label_column,
         "max_length": args.max_length,
-        "notes": "Load base model in 4-bit (GPU) and merge with this adapter for bad-word classification.",
+        "notes": "This is a compact classifier fine-tuned for bad-word detection (no LoRA/quant).",
         "train_seconds": round(t1 - t0, 2),
         "preset": args.preset,
     }
-    with open(os.path.join(args.output_dir, "inference_card.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.output_dir, "inference_card.json"), "w", encoding="utf-8")n"), "w", encoding="utf-8") as f:
         json.dump(card, f, indent=2)
 
     print(f"Training complete in {round(t1 - t0, 2)}s. Adapter saved to: {args.output_dir}")
