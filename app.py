@@ -695,51 +695,37 @@ def _fuzzy_hits(token: str, candidates: Set[str], limit: int = 5, threshold: int
         return out
 
 
-def find_bad_words(text: str, fuzzy_threshold: int = 85) -> Set[str]:
-    """Lexicon-based bad words finder (fallback when model says 'clean' or is unavailable)."""
+def find_bad_words(text: str) -> Set[str]:
+    """
+    Stricter lexicon-based bad words finder:
+    - Token-level exact matches only (no substring scanning, no fuzzy).
+    - Reduces false positives compared to earlier approach.
+    """
     hits: Set[str] = set()
-    variants = [normalize_text(text), deobfuscate(text), RE_NONALNUM.sub("", normalize_text(text))]
-    variants.append(RE_WORDSEP.sub("", normalize_text(text)))
+    # Consider normalized and deobfuscated variants, but only for tokenization
+    variants = [normalize_text(text), deobfuscate(text)]
 
     tried = set()
     for v in variants:
         if not v or v in tried:
             continue
         tried.add(v)
-        logger.debug("Variant preview=%s", _preview(v))
-
-        if HAS_AHO and AC_AUTOMATON_SI is not None:
-            hits.update(_automaton_find(AC_AUTOMATON_SI, v))
-        if HAS_AHO and AC_AUTOMATON_EN is not None:
-            hits.update(_automaton_find(AC_AUTOMATON_EN, v))
-        if HAS_AHO and AC_AUTOMATON_SI_SING is not None:
-            hits.update(_automaton_find(AC_AUTOMATON_SI_SING, v))
-
         latin_tokens, sinhala_tokens = tokenize(v)
+
+        # Exact token matches only, with simple length guards
         for tok in latin_tokens:
+            if len(tok) < 2:
+                continue
             if tok in BAD_WORDS_EN or tok in BAD_WORDS_SI_SINGLISH:
                 hits.add(tok)
         for tok in sinhala_tokens:
+            if len(tok) < 2:
+                continue
             if tok in BAD_WORDS_SI:
                 hits.add(tok)
 
-        if not HAS_AHO:
-            hits.update(_match_substrings_simple(v, BAD_WORDS_SI, min_len=2))
-            hits.update(_match_substrings_simple(v, BAD_WORDS_EN, min_len=3))
-            hits.update(_match_substrings_simple(v, BAD_WORDS_SI_SINGLISH, min_len=3))
-
-        if HAS_RAPIDFUZZ:
-            for tok in latin_tokens:
-                if 2 <= len(tok) <= 40:
-                    f = _fuzzy_hits(tok, BAD_WORDS_EN.union(BAD_WORDS_SI_SINGLISH), limit=5, threshold=fuzzy_threshold)
-                    hits.update(f)
-            s = v.strip()
-            if 3 <= len(s) <= 40:
-                f2 = _fuzzy_hits(s, BAD_WORDS_EN.union(BAD_WORDS_SI_SINGLISH), limit=5, threshold=max(60, fuzzy_threshold - 15))
-                hits.update(f2)
-
     if hits:
-        logger.debug("Final hits: %s", sorted(hits)[:100])
+        logger.debug("Final hits (strict): %s", sorted(hits)[:100])
     return hits
 
 
