@@ -836,29 +836,7 @@ def main():
     if has_cuda:
         model_kwargs.update(dict(torch_dtype=compute_dtype, device_map={"": 0} if torch.cuda.device_count() >= 1 else "auto"))
     else:
-        model_kwargs.update(dict(torch_dtype=torch.float_code >= 1 else "auto"))
-        else:
-            model_kwargs.update(dict(torch_dtype=torch.float32))
-    else:
-        if has_cuda:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=compute_dtype,
-            )
-            # Prefer binding entirely to GPU 0 when available
-            device_map = {"": 0} if torch.cuda.device_count() >= 1 else "auto"
-            model_kwargs.update(
-                dict(
-                    quantization_config=bnb_config,
-                    torch_dtype=compute_dtype,
-                    device_map=device_map,
-                )
-            )
-        else:
-            # CPU path (likely OOM for LLMs). No quantization_config.
-            model_kwargs.update(dict(torch_dtype=torch.float32))
+        model_kwargs.update(dict(torch_dtype=torch.float32))
 
     logging.info(f"Loading base model: {active_model_id}")
     try:
@@ -874,45 +852,8 @@ def main():
             model = AutoModelForSequenceClassification.from_pretrained(active_model_id, **model_kwargs)
         else:
             raise
-    logging.info(f"Model loaded. Dtype: {getattr(model, 'dtype', 'mixed')}, gradient_checkpointing={args.gradient_checkpointing}")
-
-    if args.gradient_checkpointing and has_cuda and not small_model:
-        # Prefer non-reentrant checkpointing to avoid future torch warning
-        try:
-            # Newer transformers accept kwargs dict
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            logging.info("Enabled gradient checkpointing with use_reentrant=False via kwargs dict.")
-        except TypeError:
-            try:
-                # Some versions accept use_reentrant kw directly
-                model.gradient_checkpointing_enable(use_reentrant=False)
-                logging.info("Enabled gradient checkpointing with use_reentrant=False (direct kw).")
-            except Exception:
-                # Fallback to default behavior if signature doesn't support the flag
-                model.gradient_checkpointing_enable()
-                logging.info("Enabled gradient checkpointing with default settings (use_reentrant default).")
-
-    # Prepare for k-bit training and apply LoRA (GPU only, LLM path)
-    if has_cuda and not small_model:
-        model = prepare_model_for_kbit_training(model)
-
-    if not small_model:
-        # Typical Llama/Gemma target modules
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-
-        lora_cfg = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=target_modules,
-            bias="none",
-            task_type=TaskType.SEQ_CLS,
-        )
-        logging.info(f"LoRA config: r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, targets={target_modules}")
-
-        model = get_peft_model(model, lora_cfg)
-    else:
-        logging.info("Small classifier preset active: training full model head without LoRA or 4-bit quantization.")
+    logging.info(f"Model loaded. Dtype: {getattr(model, 'dtype', 'mixed')}")
+    logging.info("Small classifier active: training full model head without LoRA or 4-bit quantization.")
 
     # Class weights from training labels
     class_weights = compute_class_weights(list(ds["train"][args.label_column]))
@@ -1091,10 +1032,10 @@ def main():
         "train_seconds": round(t1 - t0, 2),
         "preset": args.preset,
     }
-    with open(os.path.join(args.output_dir, "inference_card.json"), "w", encoding="utf-8")n"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.output_dir, "inference_card.json"), "w", encoding="utf-8") as f:
         json.dump(card, f, indent=2)
 
-    print(f"Training complete in {round(t1 - t0, 2)}s. Adapter saved to: {args.output_dir}")
+    print(f"Training complete in {round(t1 - t0, 2)}s. Model saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":
