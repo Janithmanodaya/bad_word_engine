@@ -402,7 +402,9 @@ class WeightedTrainer(Trainer):
         super().__init__(**kwargs)
         self.class_weights = class_weights
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    # Accept **kwargs to be compatible with Transformers v5 which passes
+    # num_items_in_batch into compute_loss.
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.logits
@@ -411,9 +413,7 @@ class WeightedTrainer(Trainer):
             weights = self.class_weights.to(device)
             loss_fct = torch.nn.CrossEntropyLoss(weight=weights)
         else:
-            loss_fct = torch.nn.CrossEntropyLoss()
-        loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
-        return (loss, outputs) if return_outputs else loss
+            loss_fct = torch.nn.Crossrn_outputs else loss
 
 # ---------------------------
 # Data module
@@ -806,16 +806,18 @@ def main():
         }
 
     # Training args
-    # Transformers v5 renamed 'evaluation_strategy' -> 'eval_strategy'.
+    # Robustly detect which argument name TrainingArguments supports by introspection.
+    import inspect
     try:
-        from transformers import __version__ as _tfv
+        _params = inspect.signature(TrainingArguments.__init__).parameters
+        if "eval_strategy" in _params:
+            eval_key = "eval_strategy"  # transformers v5+
+        elif "evaluation_strategy" in _params:
+            eval_key = "evaluation_strategy"  # transformers v4
+        else:
+            eval_key = None
     except Exception:
-        _tfv = "0.0.0"
-    try:
-        major_ver = int(_tfv.split(".")[0])
-    except Exception:
-        major_ver = 4
-    eval_key = "eval_strategy" if major_ver >= 5 else "evaluation_strategy"
+        eval_key = None
 
     training_kwargs = dict(
         output_dir=args.output_dir,
@@ -836,7 +838,8 @@ def main():
         push_to_hub=args.push_to_hub,
         hub_model_id=args.hub_model_id,
     )
-    training_kwargs[eval_key] = "steps"
+    if eval_key:
+        training_kwargs[eval_key] = "steps"
     training_kwargs["eval_steps"] = args.eval_steps
 
     if has_cuda:
