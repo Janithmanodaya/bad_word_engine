@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
-Convenience entrypoint to run the bad-words QLoRA trainer.
+Convenience entrypoint to run the compact ML bad-words trainer.
 
-This wraps train_gemma_badwords.py: it keeps Gemma as the default base model
-but will automatically fall back to an open model if the Gemma repo is gated
-and you are not authenticated with Hugging Face.
+This wraps train_gemma_badwords.py which trains a small classifier (scikit-learn TF-IDF + LinearSVC
+or optional FastText) without any LLM components.
 
 Usage:
   python run.py --help
   python run.py --dataset_path data/auto_badwords_en_si.csv
-
-To use Gemma, ensure you have accepted the license and are logged in:
-  export HF_TOKEN=hf_xxx
-  python run.py --base_model google/gemma-2-2b-it
+  python run.py --extra_bad_csv bad.csv  # augment with your Sinhala comma-separated list
 """
 from train_gemma_badwords import main
 
