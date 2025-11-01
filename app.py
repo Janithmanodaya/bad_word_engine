@@ -401,7 +401,7 @@ async def check_default(req: Request, payload: CheckRequest):
     logger.info("Outgoing /check: found=%s hits=%d", bool(hits), len(hits))
     if payload.advanced:
         return AdvancedResponse(found=bool(hits), bad_words=sorted(hits, key=lambda s: (len(s), s)))
-    return DefaultResponse(found=bool(hi_codetsnew)</)
+    return DefaultResponse(found=bool(hits))
 
 
 
