@@ -51,6 +51,26 @@ BAD_WORDS_EN: Set[str] = set()
 BAD_WORDS_SI: Set[str] = set()
 BAD_WORDS_SI_SINGLISH: Set[str] = set()
 
+# Minimal built-in fallback list to avoid empty English lexicon when remote fetch fails
+DEFAULT_EN_BAD_WORDS: Set[str] = {
+    "ass",
+    "bastard",
+    "bitch",
+    "bloody",
+    "bollocks",
+    "crap",
+    "cunt",
+    "damn",
+    "dick",
+    "fuck",
+    "motherfucker",
+    "piss",
+    "prick",
+    "shit",
+    "slut",
+    "whore",
+}
+
 # Aho-corasick automatons (optional)
 AC_AUTOMATON_EN = None
 AC_AUTOMATON_SI = None
@@ -178,8 +198,8 @@ def _expand_mirrors(url: str) -> List[str]:
     m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)", url)
     if m:
         user, repo, branch, path = m.groups()
+        # Prefer stable mirrors; remove fastgit due to frequent DNS failures
         urls.append(f"https://cdn.jsdelivr.net/gh/{user}/{repo}@{branch}/{path}")
-        urls.append(f"https://raw.fastgit.org/{user}/{repo}/{branch}/{path}")
         urls.append(f"https://rawcdn.githack.com/{user}/{repo}/{branch}/{path}")
     return urls
 
@@ -192,7 +212,8 @@ def load_en_bad_words() -> Set[str]:
         logger.info("Loading English bad words from override URL: %s", override)
         words = {w.lower() for w in fetch_text_lines(override)}
         logger.info("Loaded %d English bad words (override)", len(words))
-        return words
+        if words:
+            return words
 
     logger.info("Loading English bad words (LDNOOBW)...")
     urls = [
@@ -201,12 +222,20 @@ def load_en_bad_words() -> Set[str]:
     ]
     words: Set[str] = set()
     for u in urls:
-        for w in fetch_text_lines(u):
-            words.add(w.lower())
-        if words:
+        fetched = fetch_text_lines(u)
+        if fetched:
+            for w in fetched:
+                words.add(w.lower())
             break
+
     if not words:
-        logger.warning("LDNOOBW fetch failed; English list is empty. Set BAD_WORDS_EN_URL or ensure GitHub raw access.")
+        # Fallback to built-in minimal list to ensure service remains functional
+        logger.warning(
+            "LDNOOBW fetch failed; using built-in minimal English list. "
+            "Set BAD_WORDS_EN_URL to your own list for full coverage."
+        )
+        words = set(DEFAULT_EN_BAD_WORDS)
+
     logger.info("Loaded %d English bad words", len(words))
     return words
 
@@ -275,6 +304,8 @@ def load_si_bad_words_sold() -> Set[str]:
         logger.warning("Failed to load SOLD: %s", e)
         return words
 
+    import ast
+
     for split_name in sold.keys():
         split = sold[split_name]
         for item in split:
@@ -291,14 +322,41 @@ def load_si_bad_words_sold() -> Set[str]:
                     break
             if not tokens or rationals is None:
                 continue
+
+            # normalize tokens to list
             if isinstance(tokens, str):
                 toks = tokens.split()
             else:
                 toks = tokens
+
+            # normalize rationals/rationales to list[int]
             if isinstance(rationals, str):
-                rats = [int(x) for x in rationals.split()]
+                rats: List[int] = []
+                try:
+                    parsed = ast.literal_eval(rationals)
+                    if isinstance(parsed, (list, tuple)):
+                        for x in parsed:
+                            try:
+                                rats.append(int(x))
+                            except Exception:
+                                continue
+                    else:
+                        for x in str(parsed).replace(",", " ").split():
+                            if x.isdigit():
+                                rats.append(int(x))
+                except Exception:
+                    for x in rationals.replace("[", " ").replace("]", " ").replace(",", " ").split():
+                        if x.isdigit():
+                            try:
+                                rats.append(int(x))
+                            except Exception:
+                                continue
             else:
-                rats = [int(x) for x in rationals]
+                try:
+                    rats = [int(x) for x in rationals]
+                except Exception:
+                    rats = []
+
             for t, r in zip(toks, rats):
                 if r == 1:
                     words.add(t)
