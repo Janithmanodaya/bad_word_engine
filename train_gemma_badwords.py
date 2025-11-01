@@ -152,6 +152,7 @@ from transformers import (
     set_seed,
 )
 from transformers.utils import logging as hf_logging
+from transformers.trainer_utils import get_last_checkpoint
 from peft import (
     LoraConfig,
     TaskType,
@@ -556,6 +557,9 @@ def main():
     parser.add_argument("--enforce_gpu_name", action="store_true", help="If true and require_gpu_name set, exit if the CUDA device name doesn't match.")
     # Fresh start / cache clearing
     parser.add_argument("--fresh_start", action="store_true", help="Delete output_dir and model/dataset caches before starting.")
+    # Resume options
+    parser.add_argument("--resume", action="store_true", help="Auto-resume from the last checkpoint found in output_dir if available.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint to resume from. If set, overrides --resume.")
     # Use SOLD dataset
     parser.add_argument("--use_sold", action="store_true", help="Use 'sinhala-nlp/SOLD' dataset from Hugging Face hub instead of local file/auto wordlists.")
     # Auth and fallback
@@ -941,8 +945,28 @@ def main():
     logging.info("=" * 70)
 
     logging.info("Beginning training...")
+    # Determine resume path if requested
+    resume_arg = None
+    if args.resume_from_checkpoint:
+        resume_arg = args.resume_from_checkpoint
+        logging.info("[resume] Explicit checkpoint path provided: %s", resume_arg)
+    elif args.resume and not args.fresh_start:
+        try:
+            if os.path.isdir(args.output_dir):
+                last_ckpt = get_last_checkpoint(args.output_dir)
+                if last_ckpt:
+                    resume_arg = last_ckpt
+                    logging.info("[resume] Found last checkpoint in output_dir: %s", resume_arg)
+                else:
+                    logging.info("[resume] No checkpoint found in output_dir: %s", args.output_dir)
+        except Exception as e:
+            logging.warning("[resume] Failed to detect last checkpoint: %s", e)
+
     t0 = time.time()
-    train_result = trainer.train()
+    if resume_arg:
+        train_result = trainer.train(resume_from_checkpoint=resume_arg)
+    else:
+        train_result = trainer.train()
     t1 = time.time()
     logging.info(f"Training finished. Seconds: {round(t1 - t0, 2)}")
     try:
