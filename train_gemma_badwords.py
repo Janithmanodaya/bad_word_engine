@@ -826,18 +826,20 @@ def main():
                         si_urls_list = [ln.strip() for ln in f if ln.strip()]
                 else:
                     si_urls_list = [s.strip() for s in raw_si.split(",") if s.strip()]
-            # STRICT: if Sinhala requested, URLs must be provided
+            # STRICT for wordlists, but allow automatic SOLD dataset if URLs not provided
             if any(l.lower() == "si" for l in langs) and not si_urls_list:
-                raise SystemExit("Sinhala language requested in --bad_words_langs, but --si_wordlist_urls was not provided. Please supply exact Sinhala wordlist URLs or a file path containing them.")
-            bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url, si_overrides=si_urls_list)
-            clean_words = download_clean_words(url=args.clean_words_url, limit=args.wordlist_clean_limit)
-            if not bad_words:
-                logging.warning("[wordlist] No bad words downloaded; training may not be meaningful.")
-            if not clean_words:
-                logging.warning("[wordlist] No clean words downloaded; training may not be meaningful.")
-            build_wordlist_dataset_csv(dataset_path, bad_words, clean_words, augment_context=args.augment_context)
-            # Summarize download results for clear verification in logs
-            _summarize_downloads()
+                logging.info("[wordlist] Sinhala requested but no --si_wordlist_urls provided. Switching to SOLD dataset (hub/parquet/local TSV).")
+                args.use_sold = True
+            if not args.use_sold:
+                bad_words = download_bad_words(langs, repo_base=args.bad_words_repo_url, si_overrides=si_urls_list)
+                clean_words = download_clean_words(url=args.clean_words_url, limit=args.wordlist_clean_limit)
+                if not bad_words:
+                    logging.warning("[wordlist] No bad words downloaded; training may not be meaningful.")
+                if not clean_words:
+                    logging.warning("[wordlist] No clean words downloaded; training may not be meaningful.")
+                build_wordlist_dataset_csv(dataset_path, bad_words, clean_words, augment_context=args.augment_context)
+                # Summarize download results for clear verification in logs
+                _summarize_downloads()
 
         # Dataset presence or download otherwise
         dataset_path = maybe_download_dataset(dataset_path, args.dataset_url)
