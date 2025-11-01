@@ -15,17 +15,40 @@ BAD_WORDS_SI_SINGLISH: Set[str] = set()
 
 
 def normalize_text(text: str) -> str:
-    # Normalize to NFKC and lower-case
     t = unicodedata.normalize("NFKC", text)
-    # Remove zero-width characters
     t = t.replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
     return t.lower()
 
 
+def deobfuscate(text: str) -> str:
+    t = normalize_text(text)
+    # Leet/symbol substitutions for Latin content
+    subs = {
+        "@": "a",
+        "$": "s",
+        "€": "e",
+        "£": "l",
+        "1": "i",
+        "!": "i",
+        "3": "e",
+        "4": "a",
+        "0": "o",
+        "7": "t",
+        "5": "s",
+        "8": "b",
+        "9": "g",
+        "|": "i",
+    }
+    t = "".join(subs.get(ch, ch) for ch in t)
+    # Collapse repeated characters (3+ -> 2)
+    t = re.sub(r"(.)\1{2,}", r"\1\1", t)
+    # Strip diacritics for Latin
+    t = "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c))
+    return t
+
+
 def tokenize(text: str) -> Tuple[List[str], List[str]]:
-    # English/Latin tokens
     latin_tokens = re.findall(r"[A-Za-z']+", text)
-    # Sinhala Unicode block tokens (U+0D80..U+0DFF)
     sinhala_tokens = re.findall(r"[\u0D80-\u0DFF]+", text)
     return latin_tokens, sinhala_tokens
 
@@ -41,7 +64,6 @@ def fetch_text_lines(url: str, timeout: int = 15) -> List[str]:
 
 
 def load_en_bad_words() -> Set[str]:
-    # LDNOOBW english list
     urls = [
         "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master/en.txt",
         "https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/main/en.txt",
@@ -56,7 +78,6 @@ def load_en_bad_words() -> Set[str]:
 
 
 def load_si_bad_words_mrmrvl() -> Tuple[Set[str], Set[str]]:
-    # Try multiple plausible file paths (Unicode and Singlish lists)
     candidates_unicode = [
         "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/main/sinhala-bad-words-unicode.txt",
         "https://raw.githubusercontent.com/MrMRVLS/sinhala-bad-words-list/master/sinhala-bad-words-unicode.txt",
@@ -88,7 +109,6 @@ def load_si_bad_words_mrmrvl() -> Tuple[Set[str], Set[str]]:
 
 
 def load_si_bad_words_sold() -> Set[str]:
-    # Derive Sinhala offensive tokens from the SOLD dataset if available
     words: Set[str] = set()
     try:
         from datasets import load_dataset  # type: ignore
@@ -123,6 +143,36 @@ def load_si_bad_words_sold() -> Set[str]:
     return words
 
 
+def load_custom_words_from_env() -> Tuple[Set[str], Set[str], Set[str]]:
+    en: Set[str] = set()
+    si: Set[str] = set()
+    si_sing: Set[str] = set()
+
+    # Comma-separated list
+    raw = os.getenv("BAD_WORDS_CUSTOM", "")
+    if raw:
+        for w in raw.split(","):
+            w = w.strip()
+            if not w:
+                continue
+            # Heuristic: Sinhala block vs Latin
+            if re.search(r"[\u0D80-\u0DFF]", w):
+                si.add(unicodedata.normalize("NFKC", w))
+            else:
+                en.add(w.lower())
+
+    # Optional URL to a text file (one word per line)
+    url = os.getenv("BAD_WORDS_URL", "")
+    if url:
+        for w in fetch_text_lines(url):
+            if re.search(r"[\u0D80-\u0DFF]", w):
+                si.add(unicodedata.normalize("NFKC", w))
+            else:
+                en.add(w.lower())
+
+    return en, si, si_sing
+
+
 def init_lexicons() -> None:
     global BAD_WORDS_EN, BAD_WORDS_SI, BAD_WORDS_SI_SINGLISH
     BAD_WORDS_EN = load_en_bad_words()
@@ -130,7 +180,6 @@ def init_lexicons() -> None:
     si_unicode_mrmrvl, si_singlish_mrmrvl = load_si_bad_words_mrmrvl()
     si_sold = load_si_bad_words_sold()
 
-    # Merge sources
     BAD_WORDS_SI = set()
     for w in si_unicode_mrmrvl.union(si_sold):
         BAD_WORDS_SI.add(unicodedata.normalize("NFKC", w))
@@ -139,6 +188,12 @@ def init_lexicons() -> None:
     for w in si_singlish_mrmrvl:
         BAD_WORDS_SI_SINGLISH.add(w.lower())
 
+    # Merge custom env-provided words
+    en_c, si_c, si_sing_c = load_custom_words_from_env()
+    BAD_WORDS_EN.update(en_c)
+    BAD_WORDS_SI.update(si_c)
+    BAD_WORDS_SI_SINGLISH.update(si_sing_c)
+
 
 def check_api_key(req: Request, expected_key: str) -> None:
     key = req.headers.get("X-API-Key", "")
@@ -146,26 +201,34 @@ def check_api_key(req: Request, expected_key: str) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def find_bad_words(text: str) -> Set[str]:
-    t_norm = normalize_text(text)
-    latin_tokens, sinhala_tokens = tokenize(t_norm)
+def _match_substrings(text: str, candidates: Set[str], min_len: int = 4) -> Set[str]:
+    hits: Set[str] = set()
+    for w in candidates:
+        if len(w) >= min_len and w in text:
+            hits.add(w)
+    return hits
 
+
+def find_bad_words(text: str) -> Set[str]:
     hits: Set[str] = set()
 
-    # English
-    for tok in latin_tokens:
-        if tok in BAD_WORDS_EN or tok in BAD_WORDS_SI_SINGLISH:
-            hits.add(tok)
+    variants = [normalize_text(text), deobfuscate(text)]
+    for t_norm in variants:
+        latin_tokens, sinhala_tokens = tokenize(t_norm)
 
-    # Sinhala (exact token matches)
-    for tok in sinhala_tokens:
-        if tok in BAD_WORDS_SI:
-            hits.add(tok)
+        for tok in latin_tokens:
+            if tok in BAD_WORDS_EN or tok in BAD_WORDS_SI_SINGLISH:
+                hits.add(tok)
 
-    # Sinhala substring fallback (handles morphological attachments)
-    for w in BAD_WORDS_SI:
-        if w and w in t_norm:
-            hits.add(w)
+        for tok in sinhala_tokens:
+            if tok in BAD_WORDS_SI:
+                hits.add(tok)
+
+        # Sinhala substring fallback (captures suffixes/prefixes)
+        hits.update(_match_substrings(t_norm, BAD_WORDS_SI, min_len=2))
+        # English/Singlish substring fallback (avoid short false-positives)
+        hits.update(_match_substrings(t_norm, BAD_WORDS_EN, min_len=4))
+        hits.update(_match_substrings(t_norm, BAD_WORDS_SI_SINGLISH, min_len=4))
 
     return hits
 
@@ -194,7 +257,12 @@ def on_startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "en_words": len(BAD_WORDS_EN), "si_words": len(BAD_WORDS_SI)}
+    return {
+        "status": "ok",
+        "en_words": len(BAD_WORDS_EN),
+        "si_words": len(BAD_WORDS_SI),
+        "si_singlish_words": len(BAD_WORDS_SI_SINGLISH),
+    }
 
 
 @app.post("/check")
@@ -213,7 +281,6 @@ def parse_host_port(url_str: str) -> Tuple[str, int]:
     if not url_str:
         return default_host, default_port
 
-    # Add scheme if missing to help urlparse
     if "://" not in url_str:
         url_str_work = "http://" + url_str
     else:
@@ -226,8 +293,6 @@ def parse_host_port(url_str: str) -> Tuple[str, int]:
 
 
 if __name__ == "__main__":
-    # Prefer platform-provided PORT, and always bind to 0.0.0.0 inside containers.
-    # Fallback to SERVER_URL only for the port if PORT is not set.
     port_env = os.getenv("PORT")
     if port_env and port_env.isdigit():
         port = int(port_env)
@@ -236,7 +301,6 @@ if __name__ == "__main__":
 
     host = os.getenv("HOST", "0.0.0.0")
 
-    # Lazy import to avoid dependency if not running directly
     import uvicorn
 
     uvicorn.run("app:app", host=host, port=port, reload=False)
