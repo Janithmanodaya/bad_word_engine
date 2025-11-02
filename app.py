@@ -522,44 +522,36 @@ def _load_semisold_tokens(threshold: float = 0.8, top_tokens: int = 1000) -> Set
 
 def init_lexicons() -> None:
     global BAD_WORDS_EN, BAD_WORDS_SI, BAD_WORDS_SI_SINGLISH, AC_AUTOMATON_EN, AC_AUTOMATON_SI, AC_AUTOMATON_SI_SING
-    logger.info("Initializing lexicons (improved)...")
+    logger.info("Initializing lexicons (ML-first; no Sinhala remote downloads)...")
+
+    # English lexicon (still loaded from LDNOOBW or override URL)
     BAD_WORDS_EN = load_en_bad_words()
-    si_unicode_mrmrvl, si_singlish_mrmrvl = load_si_bad_words_mrmrvl()
-    si_sold = load_si_bad_words_sold()
-    thr = float(os.getenv("SEMISOLD_THRESHOLD", "0.8"))
-    topn = int(os.getenv("SEMISOLD_TOP_TOKENS", "1000"))
-    si_semisold = _load_semisold_tokens(threshold=thr, top_tokens=topn)
 
-    # Build Sinhala set and apply stopword filter, include built-in defaults
+    # IMPORTANT: We do not download Sinhala lists anymore.
+    # Rely on the ML model primarily. Keep minimal defaults and optional local CSV/env overrides for lexicon fallback.
     BAD_WORDS_SI = set(DEFAULT_SI_BAD_WORDS)
+
+    # Optional local CSV additions (no network)
     si_extra_csv = load_additional_si_bad_csv(os.getenv("BAD_CSV_PATH", "bad.csv"))
-    for w in si_unicode_mrmrvl.union(si_sold).union(si_semisold).union(si_extra_csv):
+    for w in si_extra_csv:
         w_norm = unicodedata.normalize("NFKC", w)
-        if len(w_norm) < 3:
-            continue
-        if w_norm in SINHALA_STOPWORDS:
-            continue
-        BAD_WORDS_SI.add(w_norm)
+        if len(w_norm) >= 3 and w_norm not in SINHALA_STOPWORDS:
+            BAD_WORDS_SI.add(w_norm)
 
-    # Singlish set (lowercased) include built-in defaults
+    # Singlish: minimal defaults only (plus env custom below). No network fetch.
     BAD_WORDS_SI_SINGLISH = set(x.lower() for x in DEFAULT_SINGLISH_BAD_WORDS)
-    for w in si_singlish_mrmrvl:
-        w_l = w.lower().strip()
-        if len(w_l) < 2:
-            continue
-        BAD_WORDS_SI_SINGLISH.add(w_l)
 
-    # Custom overrides from env
+    # Custom overrides from env (may include Sinhala Unicode or Singlish terms)
     en_c, si_c, si_sing_c = load_custom_words_from_env()
     BAD_WORDS_EN.update(en_c)
     BAD_WORDS_SI.update({unicodedata.normalize("NFKC", w) for w in si_c if len(w) >= 3 and w not in SINHALA_STOPWORDS})
     BAD_WORDS_SI_SINGLISH.update({w.lower() for w in si_sing_c if len(w) >= 2})
 
-    # build automatons if available
+    # Build automatons if available (EN and Singlish only to avoid Sinhala substring false positives)
     if HAS_AHO:
         try:
             AC_AUTOMATON_EN = build_automaton(BAD_WORDS_EN)
-            AC_AUTOMATON_SI = None  # Avoid Sinhala substring automaton to reduce false positives
+            AC_AUTOMATON_SI = None
             AC_AUTOMATON_SI_SING = build_automaton(BAD_WORDS_SI_SINGLISH)
             logger.info("Aho-Corasick automatons built (enabled for EN/Singlish)")
         except Exception as e:
@@ -567,13 +559,12 @@ def init_lexicons() -> None:
     else:
         logger.info("pyahocorasick not available: substring scanning will be slower")
 
+    # Make it explicit in logs that network-based Sinhala sources are disabled
     logger.info(
-        "Lexicons ready: EN=%d SI=%d SI_singlish=%d (USE_SOLD=%s USE_SEMISOLD=%s) HAS_AHO=%s HAS_RAPIDFUZZ=%s",
+        "Lexicons ready: EN=%d SI=%d SI_singlish=%d (SOLD=disabled SemiSOLD=disabled) HAS_AHO=%s HAS_RAPIDFUZZ=%s",
         len(BAD_WORDS_EN),
         len(BAD_WORDS_SI),
         len(BAD_WORDS_SI_SINGLISH),
-        os.getenv("USE_SOLD", "0"),
-        os.getenv("USE_SEMISOLD", "0"),
         HAS_AHO,
         HAS_RAPIDFUZZ,
     )
