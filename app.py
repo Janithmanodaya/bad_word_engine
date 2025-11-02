@@ -29,6 +29,11 @@ ML_DISABLED: bool = os.getenv("ML_DISABLE", "").strip().lower() in {"1", "true",
 PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "").strip().lower() in {"1", "true", "yes"}
 _model_bundle = None  # dict with keys: "vec_char", "vec_word", "classifier"
 
+# Subprocess prediction worker globals
+_predict_req_q = None
+_predict_resp_q = None
+_predict_proc = None
+
 def _preview(text: str, n: int = 140) -> str:
     return text if len(text) <= n else text[:n] + "...(truncated)"
 
