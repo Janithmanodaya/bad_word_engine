@@ -25,7 +25,7 @@ logger = logging.getLogger("badwords_service_ml")
 MODEL_AVAILABLE: bool = False
 MODEL_PATH: str = ""
 ML_DISABLED: bool = os.getenv("ML_DISABLE", "").strip().lower() in {"1", "true", "yes"}
-PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "1").strip().lower() in {"1", "true", "yes"}
+PREDICT_IN_SUBPROCESS: bool = False
 _model_bundle = None  # dict with keys: "vec_char", "vec_word", "classifier"
 
 def _preview(text: str, n: int = 140) -> str:
