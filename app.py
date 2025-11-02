@@ -22,6 +22,7 @@ logger = logging.getLogger("badwords_service_ml")
 # Globals (ML)
 MODEL_AVAILABLE: bool = False
 MODEL_PATH: str = ""
+ML_DISABLED: bool = os.getenv("ML_DISABLE", "").strip().lower() in {"1", "true", "yes"}
 _model_bundle = None  # dict with keys: "vec_char", "vec_word", "classifier"
 
 def _preview(text: str, n: int = 140) -> str:
@@ -100,9 +101,13 @@ def _discover_model_path() -> Optional[str]:
     return None
 
 def load_model() -> None:
-    global MODEL_AVAILABLE, MODEL_PATH, _model_bundle
+    global MODEL_AVAILABLE, MODEL_PATH, _model_bundle, ML_DISABLED
     MODEL_AVAILABLE = False
     _model_bundle = None
+
+    if ML_DISABLED:
+        logger.info("ML model loading disabled via ML_DISABLE env. Service will return 503 for /check.")
+        return
 
     model_file = _discover_model_path()
     if not model_file:
@@ -168,7 +173,7 @@ def model_predict_is_bad(text: str) -> Optional[bool]:
     - Avoid dense stack and BLAS-backed dot products which may segfault in slim containers.
     - Compute the linear decision score manually using sparse nonzeros.
     """
-    if not MODEL_AVAILABLE or _model_bundle is None:
+    if ML_DISABLED or not MODEL_AVAILABLE or _model_bundle is None:
         return None
     try:
         vec_char = _model_bundle["vec_char"]
@@ -181,9 +186,8 @@ def model_predict_is_bad(text: str) -> Optional[bool]:
 
         # Expect a linear classifier (LinearSVC or LogisticRegression) with coef_/intercept_
         if not (hasattr(clf, "coef_") and hasattr(clf, "intercept_")):
-            # Fall back to standard predict (may invoke native paths)
-            y_pred = clf.predict(Xc)  # shape-compatible but meaningless; just to trigger exception to None
-            return bool(int(y_pred[0]) == 1)
+            logger.warning("Classifier without coef_/intercept_ encountered; returning None to avoid native predict path.")
+            return None
 
         import numpy as _np  # type: ignore
         coef = _np.asarray(getattr(clf, "coef_"))
