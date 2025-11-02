@@ -813,6 +813,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "bad-words service"}
+
 @app.get("/health")
 def health():
     return {
