@@ -686,9 +686,14 @@ def model_predict_is_bad(text: str) -> Optional[bool]:
         # The vectorizers already embed normalization preprocessors from training.
         Xc = vec_char.transform([text])
         Xw = vec_word.transform([text])
-        # Use scipy.sparse.hstack without importing globally (avoid heavy dep in import path)
-        from scipy.sparse import hstack as _hstack  # type: ignore
-        X = _hstack([Xc, Xw])
+
+        # Avoid scipy.sparse.hstack to prevent native segfaults in constrained environments.
+        # Convert to dense and concatenate via numpy. For single-sample inference this is acceptable.
+        import numpy as _np  # type: ignore
+        Xc_dense = Xc.toarray()
+        Xw_dense = Xw.toarray()
+        X = _np.hstack([Xc_dense, Xw_dense])
+
         y_pred = clf.predict(X)
         return bool(int(y_pred[0]) == 1)
     except Exception as e:
