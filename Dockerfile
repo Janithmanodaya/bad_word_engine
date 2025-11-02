@@ -26,7 +26,10 @@ ENV SERVER_URL=0.0.0.0:8000 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
     # Disable native C-extensions in text matching by default; can override at runtime
-    DISABLE_NATIVE=1
+    DISABLE_NATIVE=1 \
+    # Disable ML model by default to avoid potential native segfaults from scipy/sklearn in minimal containers.
+    # You can re-enable by setting ML_DISABLE=0 at deploy/runtime if your base image provides stable BLAS/ SciPy wheels.
+    ML_DISABLE=1
 
 EXPOSE 8000
 
