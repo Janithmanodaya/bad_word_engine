@@ -40,7 +40,7 @@ def in_colab() -> bool:
         return False
 
 # ---------------------------
-# Bootstrap: ensure minimal dependencies installed
+# Bootstrap: optional dependency setup (disabled by default)
 # ---------------------------
 
 REQUIRED_PKGS = [
@@ -59,6 +59,11 @@ def _is_installed(module: str) -> bool:
     return importlib.util.find_spec(module) is not None
 
 def ensure_dependencies():
+    """
+    Optionally install missing packages at runtime.
+    Disabled by default to avoid pip activity during normal training runs.
+    Use --setup_deps to enable, or rely on requirements.txt.
+    """
     missing = []
     import_name_map = {
         "scikit-learn": "sklearn",
@@ -83,9 +88,7 @@ def ensure_dependencies():
         name = spec.split("==")[0].split(">=")[0]
         print(f"[setup] {name}: {'OK' if _is_installed(name) else 'MISSING'}")
 
-ensure_dependencies()
-
-# Imports after dependency check
+# Imports (assume environment has requirements installed)
 import numpy as np
 from datasets import load_dataset, DatasetDict
 from joblib import dump
@@ -685,6 +688,8 @@ def main():
     parser.add_argument("--sold_trial_path", type=str, default="data/SOLD_trial.tsv", help="Local path to SOLD trial TSV (optional).")
     # Fresh start / cache clearing
     parser.add_argument("--fresh_start", action="store_true", help="Delete output_dir before training.")
+    # Optional setup
+    parser.add_argument("--setup_deps", action="store_true", help="Install missing Python packages at runtime (useful in Colab).")
     args = parser.parse_args()
 
     # Prepare output/logging
@@ -697,6 +702,13 @@ def main():
     )
     logging.info("Starting compact ML training for bad-words classifier")
     logging.info(f"Args: {vars(args)}")
+
+    # Optional dependency setup
+    if args.setup_deps or in_colab():
+        try:
+            ensure_dependencies()
+        except Exception as e:
+            logging.warning("Dependency setup")
 
     # Fresh start
     if args.fresh_start and os.path.isdir(args.output_dir):

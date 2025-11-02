@@ -24,8 +24,9 @@ logger = logging.getLogger("badwords_service_ml")
 MODEL_AVAILABLE: bool = False
 MODEL_PATH: str = ""
 ML_DISABLED: bool = os.getenv("ML_DISABLE", "").strip().lower() in {"1", "true", "yes"}
-# Enable crash-isolated prediction via env var
-PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "1").strip().lower() in {"1", "true", "yes"}
+# Enable crash-isolated prediction via env var.
+# Default OFF to avoid heavy fork+reload overhead on tiny servers (0.2 vCPU / 256–512MB RAM).
+PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "0").strip().lower() in {"1", "true", "yes"}
 # Reduce startup work on constrained hosts
 LOW_RESOURCE_MODE: bool = os.getenv("LOW_RESOURCE_MODE", "1").strip().lower() in {"1", "true", "yes"}
 RUNTIME_DEPS_INSTALL: bool = os.getenv("RUNTIME_DEPS_INSTALL", "0").strip().lower() in {"1", "true", "yes"}
@@ -456,6 +457,8 @@ def health():
         "model_available": MODEL_AVAILABLE,
         "model_path": MODEL_PATH,
         "predict_subprocess": PREDICT_IN_SUBPROCESS,
+        "low_resource_mode": LOW_RESOURCE_MODE,
+        "ml_disabled": ML_DISABLED,
     }
 
 def check_api_key(req: Request, expected_key: str) -> None:
