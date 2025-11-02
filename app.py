@@ -497,7 +497,11 @@ async def check_default(req: Request, payload: CheckRequest):
 
     # Lazy load model on first use and predict
     res = model_predict_is_bad(text_in)
-    if)
+    if res is None:
+        # Model unavailable or inference error
+        raise HTTPException(status_code=503, detail="Model unavailable")
+
+    return DefaultResponse(found=bool(res))
 
 # Backward/compat alias for clients calling /check/check
 @app.post("/check/check")
