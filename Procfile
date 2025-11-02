@@ -1,1 +1,3 @@
-web: uvicorn app:app --host 0.0.0.0 --port $PORT
+# Single-process Uvicorn with constrained threading and subprocess prediction disabled
+# These inline env vars help avoid OpenBLAS/MKL thread issues and spawn crashes on low-memory dynos
+web: OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PREDICT_SUBPROCESS=0 PREDICT_IN_SUBPROCESS=0 RUNTIME_DEPS_INSTALL=0 LOW_RESOURCE_MODE=1 uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1 --loop asyncio --no-access-log --timeout-keep-alive 5
