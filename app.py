@@ -411,3 +411,29 @@ class DefaultResponse(BaseModel):
     found: bool
 
 @asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Ensure required libs exist (attempt install if missing), then load model and run smoke tests
+    try:
+        ensure_runtime_dependencies()
+    except Exception as e:
+        logger.warning("Dependency check/install encountered an issue: %s", e)
+
+    # Always load ML model (ML-only service)
+    load_model()
+    try:
+        run_startup_smoke_tests()
+    except Exception as e:
+        logger.warning("Startup smoke tests encountered an issue: %s", e)
+
+    logger.info("Startup complete. MODEL_AVAILABLE=%s", MODEL_AVAILABLE)
+    yield
+    # No teardown required.
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "bad-words service (ml-only)"}
+
+@app.get("/favicon.ico")
+def favicon
