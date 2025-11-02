@@ -7,7 +7,7 @@ import os
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
@@ -251,6 +251,11 @@ app = FastAPI(lifespan=lifespan)
 def root():
     return {"status": "ok", "message": "bad-words service (ml-only)"}
 
+@app.get("/favicon.ico")
+def favicon():
+    # Avoid noisy 404s for browsers requesting a favicon
+    return Response(status_code=204)
+
 @app.get("/health")
 def health():
     return {
@@ -278,6 +283,11 @@ async def check_default(req: Request, payload: CheckRequest):
         raise HTTPException(status_code=503, detail="Model unavailable")
 
     return DefaultResponse(found=bool(res))
+
+# Backward/compat alias for clients calling /check/check
+@app.post("/check/check")
+async def check_default_alias(req: Request, payload: CheckRequest):
+    return await check_default(req, payload)
 
 # __main__
 if __name__ == "__main__":
