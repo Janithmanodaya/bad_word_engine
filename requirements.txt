@@ -2,10 +2,9 @@ fastapi>=0.103.0
 uvicorn>=0.23.0
 requests>=2.31.0
 datasets>=2.19.0
-pyahocorasick>=2.0.0
-rapidfuzz>=3.5.0
 Unidecode>=1.3.8
-# Pin to the version used to train the bundled model to avoid InconsistentVersionWarning
-scikit-learn==1.6.1
 joblib>=1.3.2
-scipy>=1.11.0
+# Stable numerical stack to avoid segfaults in slim containers
+numpy==1.26.4
+scipy==1.10.1
+scikit-learn==1.3.2
