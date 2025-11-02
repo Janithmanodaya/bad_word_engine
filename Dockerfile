@@ -27,8 +27,8 @@ ENV SERVER_URL=0.0.0.0:8000 \
     NUMEXPR_NUM_THREADS=1 \
     # Enable ML by default; can disable via ML_DISABLE=1 at runtime
     ML_DISABLE=0 \
-    # Run predictions in main process by default (disable subprocess isolation)
-    PREDICT_SUBPROCESS=0 \
+    # Enable subprocess isolation for predictions to prevent main-process segfaults
+    PREDICT_SUBPROCESS=1 \
     # Timeout only applies when subprocess mode is enabled
     PREDICT_TIMEOUT_SEC=30
 
