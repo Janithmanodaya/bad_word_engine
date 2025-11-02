@@ -445,7 +445,7 @@ async def lifespan(app: FastAPI):
         logger.warning("Dependency check/install encountered an issue: %s", e)
 
     # Skip eager model load; enable lazy loading on first /check call to reduce startup CPU/RAM.
-    logger.info("Startup complete. Lazy model loading enabled. MODEL_AVAILABLE=%s", MODEL_tests()
+    logger.info("Startup complete. Lazy model loading enabled. MODEL_AVAILABLE=%s", MODEL_AVAILABLE)
         except Exception as e:
             logger.warning("Startup smoke tests encountered an issue: %s", e)
 
