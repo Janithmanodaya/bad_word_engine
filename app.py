@@ -846,25 +846,8 @@ async def check_default(req: Request, payload: CheckRequest):
     return DefaultResponse(found=found)
 
 
-# Helpful __main__ for quick local testing
+# Minimal __main__: run the server (startup hooks handle model/lexicons)
 if __name__ == "__main__":
-    # quick sanity checks
-    examples = [
-        "you are a s.h.i.t!",
-        "ඔබ ම*ල*කේ",
-        "obfu$cat3d discussion",
-        "mama api *******",
-        "harak modaya",
-    ]
-    load_model()
-    init_lexicons()
-    for ex in examples:
-        print("> ", ex)
-        mr = model_predict_is_bad(ex)
-        print("  model:", mr)
-        print("  lexicon hits:", find_bad_words(ex))
-
-    # run uvicorn when invoked directly
     import uvicorn
 
     port_env = os.getenv("PORT")
