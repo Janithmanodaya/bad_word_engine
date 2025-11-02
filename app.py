@@ -76,20 +76,44 @@ def _prepare_unpickle_namespace() -> None:
 def _discover_model_path() -> Optional[str]:
     """
     Try multiple locations to find model.joblib:
+    - $MODEL_FILE (explicit file path)
     - $MODEL_DIR/model.joblib
     - ./model/model.joblib
+    - <file-dir>/model/model.joblib
     - ./outputs/badwords-ml/model.joblib
     - Path declared in ./model/inference_card.json (model_path/model.joblib)
+    - ./scripts/model/model.joblib (for repos where app.py lives under scripts/)
     """
     import json
 
     candidates = []
+
+    # Explicit env overrides
+    env_file = os.getenv("MODEL_FILE", "").strip()
+    if env_file:
+        candidates.append(env_file)
+
     env_dir = os.getenv("MODEL_DIR", "").strip()
     if env_dir:
         candidates.append(os.path.join(env_dir, "model.joblib"))
+
+    # Relative to CWD
     candidates.append(os.path.join("model", "model.joblib"))
     candidates.append(os.path.join("outputs", "badwords-ml", "model.joblib"))
 
+    # Relative to this file's directory
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(here, "model", "model.joblib"))
+        # Common alternate when running from a monorepo "scripts" folder
+        candidates.append(os.path.join(here, "scripts", "model", "model.joblib"))
+        # Also try parent dir model path if file is nested
+        parent = os.path.dirname(here)
+        candidates.append(os.path.join(parent, "model", "model.joblib"))
+    except Exception:
+        pass
+
+    # From inference card
     try:
         card_path = os.path.join("model", "inference_card.json")
         if os.path.exists(card_path):
@@ -101,16 +125,22 @@ def _discover_model_path() -> Optional[str]:
     except Exception as e:
         logger.warning("Failed to read inference_card.json: %s", e)
 
+    # Deduplicate while preserving order
     seen = set()
     uniq = []
     for p in candidates:
-        if p not in seen:
+        if p not in seen and p:
             seen.add(p)
             uniq.append(p)
 
     for p in uniq:
-        if os.path.exists(p) and os.path.isfile(p):
-            return p
+        try:
+            if os.path.exists(p) and os.path.isfile(p):
+                logger.info("Discovered model at: %s", p)
+                return p
+        except Exception:
+            continue
+
     logger.error("Model discovery failed. Checked: %s", ", ".join(uniq))
     return None
 
