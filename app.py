@@ -255,6 +255,69 @@ def model_predict_is_bad(text: str) -> Optional[bool]:
         logger.warning("Model inference failed: %s", e)
         return None
 
+def ensure_runtime_dependencies() -> None:
+    """
+    Check and install any missing runtime libraries required for inference.
+    Intended for container environments where a dependency may be absent.
+    """
+    import importlib.util as _ilu
+    import subprocess as _sp
+    import sys as _sys
+
+    # module_name -> pip spec
+    need = {
+        "numpy": "numpy==1.26.4",
+        "scipy": "scipy==1.10.1",
+        "sklearn": "scikit-learn==1.6.1",
+        "joblib": "joblib>=1.3.2",
+        "unidecode": "Unidecode>=1.3.8",
+    }
+
+    missing = [m for m in need.keys() if _ilu.find_spec(m) is None]
+    if not missing:
+        return
+
+    logger.info("Runtime deps missing (%s). Attempting install...", ", ".join(missing))
+    for mod in missing:
+        spec = need[mod]
+        try:
+            _sp.check_call([_sys.executable, "-m", "pip", "install", "--no-cache-dir", spec])
+            logger.info("Installed %s", spec)
+        except Exception as e:
+            logger.warning("Failed to install %s: %s", spec, e)
+
+    # Final report
+    still_missing = [m for m in need.keys() if _ilu.find_spec(m) is None]
+    if still_missing:
+        logger.warning("Some dependencies are still missing after install: %s", ", ".join(still_missing))
+    else:
+        logger.info("All runtime dependencies present.")
+
+
+def run_startup_smoke_tests() -> None:
+    """
+    Run quick bilingual smoke tests (Sinhala + English) to verify end-to-end inference.
+    Logs results; does not raise.
+    """
+    samples = [
+        ("si", "කෙසේද ඉතිං?"),  # neutral Sinhala
+        ("si", "අපහාසකාරී වචන තියෙනවාද?"),  # Sinhala query (may be neutral)
+        ("en", "You are an idiot."),  # likely toxic
+        ("en", "Have a wonderful day!"),  # neutral
+    ]
+    try:
+        ok = 0
+        for lang, text in samples:
+            pred = model_predict_is_bad(text)
+            if pred is None:
+                logger.info("[smoke] lang=%s text_preview=%s -> result=UNAVAILABLE", lang, _preview(text))
+            else:
+                logger.info("[smoke] lang=%s text_preview=%s -> found=%s", lang, _preview(text), bool(pred))
+                ok += 1
+        logger.info("[smoke] Completed %d/%d checks.", ok, len(samples))
+    except Exception as e:
+        logger.warning("Smoke tests failed to run: %s", e)
+
 # --- FastAPI ---
 
 class CheckRequest(BaseModel):
@@ -266,8 +329,19 @@ class DefaultResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Ensure required libs exist (attempt install if missing), then load model and run smoke tests
+    try:
+        ensure_runtime_dependencies()
+    except Exception as e:
+        logger.warning("Dependency check/install encountered an issue: %s", e)
+
     # Always load ML model (ML-only service)
     load_model()
+    try:
+        run_startup_smoke_tests()
+    except Exception as e:
+        logger.warning("Startup smoke tests encountered an issue: %s", e)
+
     logger.info("Startup complete. MODEL_AVAILABLE=%s", MODEL_AVAILABLE)
     yield
     # No teardown required.
