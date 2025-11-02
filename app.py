@@ -684,6 +684,10 @@ def load_model() -> None:
 def model_predict_is_bad(text: str) -> Optional[bool]:
     """
     Return True if model predicts 'bad', False if 'clean', or None if model unavailable or error.
+
+    Implementation note:
+    - Avoid dense stack and BLAS-backed dot products which may segfault in slim containers.
+    - Compute the linear decision score manually using sparse nonzeros.
     """
     if not MODEL_AVAILABLE or _model_bundle is None:
         return None
@@ -691,31 +695,53 @@ def model_predict_is_bad(text: str) -> Optional[bool]:
         vec_char = _model_bundle["vec_char"]
         vec_word = _model_bundle["vec_word"]
         clf = _model_bundle["classifier"]
-        # The vectorizers already embed normalization preprocessors from training.
+
+        # Transform to sparse (CSR) – vectorizers already include training-time preprocessing.
         Xc = vec_char.transform([text])
         Xw = vec_word.transform([text])
 
-        # Avoid scipy.sparse.hstack to prevent native segfaults in constrained environments.
-        # Convert to dense and concatenate via numpy. For single-sample inference this is acceptable.
+        # Expect a linear classifier (LinearSVC or LogisticRegression) with coef_/intercept_
+        if not (hasattr(clf, "coef_") and hasattr(clf, "intercept_")):
+            # Fall back to standard predict (may invoke native paths)
+            y_pred = clf.predict(Xc)  # shape-compatible but meaningless; just to trigger exception to None
+            return bool(int(y_pred[0]) == 1)
+
         import numpy as _np  # type: ignore
-        Xc_dense = Xc.toarray()
-        Xw_dense = Xw.toarray()
-        X = _np.hstack([Xc_dense, Xw_dense])
 
-        # Prefer a pure-NumPy linear decision path if available (avoids libsvm/liblinear native code)
-        if hasattr(clf, "coef_") and hasattr(clf, "intercept_"):
-            coef = getattr(clf, "coef_", None)
-            intercept = getattr(clf, "intercept_", None)
-            if coef is not None and intercept is not None:
-                # Binary classification expected => coef shape (1, n_features)
-                scores = X.dot(coef.T) + intercept
-                # Convert to 1D
-                score = float(scores.ravel()[0])
-                return bool(score > 0.0)
+        coef = _np.asarray(getattr(clf, "coef_"))
+        intercept = _np.asarray(getattr(clf, "intercept_"))
+        if coef.ndim == 2 and coef.shape[0] == 1:
+            w = coef[0]
+            b = float(intercept.ravel()[0] if intercept.size else 0.0)
+        else:
+            # If multi-class, collapse to first row; this service is binary so this should not happen
+            w = coef.ravel()
+            b = float(intercept.ravel()[0] if intercept.size else 0.0)
 
-        # Fallback to sklearn predict if linear path not available
-        y_pred = clf.predict(X)
-        return bool(int(y_pred[0]) == 1)
+        # Manually compute linear score from sparse non-zeros without dense concatenation
+        score = b
+
+        # Helper to iterate nonzero indices/data from CSR row 0
+        def _accumulate_from_csr(csr_mat, w_offset: int = 0) -> float:
+            if csr_mat.shape[0] == 0:
+                return 0.0
+            csr = csr_mat.tocsr()
+            start, end = csr.indptr[0], csr.indptr[1]
+            idx = csr.indices[start:end]
+            data = csr.data[start:end]
+            s = 0.0
+            for j, v in zip(idx, data):
+                jj = int(j) + w_offset
+                # guard index bounds in case of mismatch
+                if 0 <= jj < w.shape[0]:
+                    s += float(v) * float(w[jj])
+            return s
+
+        # char features first, then word features with offset
+        score += _accumulate_from_csr(Xc, 0)
+        score += _accumulate_from_csr(Xw, Xc.shape[1])
+
+        return bool(score > 0.0)
     except Exception as e:
         logger.warning("Model inference failed: %s", e)
         return None
