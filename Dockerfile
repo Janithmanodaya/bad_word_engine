@@ -26,7 +26,10 @@ ENV SERVER_URL=0.0.0.0:8000 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
     # Enable ML by default; can disable via ML_DISABLE=1 at runtime
-    ML_DISABLE=0
+    ML_DISABLE=0 \
+    # Run predictions in an isolated subprocess to prevent segfaults from killing the server
+    PREDICT_SUBPROCESS=1 \
+    PREDICT_TIMEOUT_SEC=5
 
 EXPOSE 8000
 

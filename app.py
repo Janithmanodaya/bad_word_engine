@@ -2,6 +2,8 @@
 # This rewrite removes all lexicon/fuzzy/substring systems and relies solely on the bundled ML model.
 # The model is loaded from model/model.joblib (or discovered paths), and inference is performed with
 # a safe, sparse, Python-level linear scorer to avoid native BLAS/segfaults in minimal containers.
+# Additionally, for maximal stability, prediction can be executed in a separate subprocess so that
+# any native crashes in scipy/sklearn cannot bring down the main server.
 
 import os
 import logging
@@ -23,6 +25,7 @@ logger = logging.getLogger("badwords_service_ml")
 MODEL_AVAILABLE: bool = False
 MODEL_PATH: str = ""
 ML_DISABLED: bool = os.getenv("ML_DISABLE", "").strip().lower() in {"1", "true", "yes"}
+PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "1").strip().lower() in {"1", "true", "yes"}
 _model_bundle = None  # dict with keys: "vec_char", "vec_word", "classifier"
 
 def _preview(text: str, n: int = 140) -> str:
@@ -46,7 +49,7 @@ def _prepare_unpickle_namespace() -> None:
                 except Exception:
                     s = ""
                 # collapse >2 repeats to two and remove separators between ASCII letters
-                s = _re.sub(r"(.)\\1{2,}", r"\\1\\1", s)
+                s = _re.sub(r"(.)\\1{2,}", r"\1\1", s)
                 s = _re.sub(r"(?:[\\W_])+(?=[A-Za-z])", "", s)
                 try:
                     from unidecode import unidecode  # type: ignore
@@ -165,6 +168,33 @@ def _linear_score_from_sparse(Xc, Xw, clf) -> float:
 
     return float(score)
 
+def _predict_worker(model_path: str, text: str, q_out):
+    """
+    Child-process worker: load model bundle from disk and produce boolean prediction.
+    Any segfault in sklearn/scipy will only terminate the child, not the server.
+    """
+    try:
+        # Prepare namespace and load
+        _prepare_unpickle_namespace()
+        from joblib import load as joblib_load  # type: ignore
+        bundle = joblib_load(model_path)
+        vec_char = bundle["vec_char"]
+        vec_word = bundle["vec_word"]
+        clf = bundle["classifier"]
+
+        Xc = vec_char.transform([text])
+        Xw = vec_word.transform([text])
+
+        # Linear score using sparse accumulation (pure Python path)
+        score = _linear_score_from_sparse(Xc, Xw, clf)
+        q_out.put(bool(score > 0.0))
+    except Exception as e:
+        # Communicate failure
+        try:
+            q_out.put({"error": str(e)})
+        except Exception:
+            pass
+
 def model_predict_is_bad(text: str) -> Optional[bool]:
     """
     Return True if model predicts 'bad', False if 'clean', or None if model unavailable or error.
@@ -172,57 +202,53 @@ def model_predict_is_bad(text: str) -> Optional[bool]:
     Implementation note:
     - Avoid dense stack and BLAS-backed dot products which may segfault in slim containers.
     - Compute the linear decision score manually using sparse nonzeros.
+    - Optionally run prediction inside a subprocess for crash isolation.
     """
-    if ML_DISABLED or not MODEL_AVAILABLE or _model_bundle is None:
+    if ML_DISABLED or not MODEL_AVAILABLE or (MODEL_PATH == "" and _model_bundle is None):
+        return None
+
+    if PREDICT_IN_SUBPROCESS and MODEL_PATH:
+        # Isolated execution
+        try:
+            import multiprocessing as mp
+            ctx = mp.get_context("spawn")
+            q = ctx.Queue(maxsize=1)
+            p = ctx.Process(target=_predict_worker, args=(MODEL_PATH, text, q))
+            p.start()
+            p.join(timeout=float(os.getenv("PREDICT_TIMEOUT_SEC", "5")))
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=1)
+                logger.warning("Prediction subprocess timed out")
+                return None
+            # If process crashed with segfault, exitcode will be non-zero
+            if p.exitcode and p.exitcode != 0:
+                logger.warning("Prediction subprocess exited with code %s", p.exitcode)
+                return None
+            try:
+                out = q.get_nowait()
+            except Exception:
+                return None
+            if isinstance(out, dict) and "error" in out:
+                logger.warning("Prediction worker error: %s", out.get("error"))
+                return None
+            return bool(out)
+        except Exception as e:
+            logger.warning("Prediction via subprocess failed: %s", e)
+            return None
+
+    # Fallback: in-process safe path (still pure-Python scorer)
+    if _model_bundle is None:
         return None
     try:
         vec_char = _model_bundle["vec_char"]
         vec_word = _model_bundle["vec_word"]
         clf = _model_bundle["classifier"]
 
-        # Transform to sparse (CSR) – vectorizers already include training-time preprocessing.
         Xc = vec_char.transform([text])
         Xw = vec_word.transform([text])
 
-        # Expect a linear classifier (LinearSVC or LogisticRegression) with coef_/intercept_
-        if not (hasattr(clf, "coef_") and hasattr(clf, "intercept_")):
-            logger.warning("Classifier without coef_/intercept_ encountered; returning None to avoid native predict path.")
-            return None
-
-        import numpy as _np  # type: ignore
-        coef = _np.asarray(getattr(clf, "coef_"))
-        intercept = _np.asarray(getattr(clf, "intercept_"))
-        if coef.ndim == 2 and coef.shape[0] == 1:
-            w = coef[0]
-            b = float(intercept.ravel()[0] if intercept.size else 0.0)
-        else:
-            # If multi-class, collapse to first row; this service is binary so this should not happen
-            w = coef.ravel()
-            b = float(intercept.ravel()[0] if intercept.size else 0.0)
-
-        # Manually compute linear score from sparse non-zeros without dense concatenation
-        score = b
-
-        # Helper to iterate nonzero indices/data from CSR row 0
-        def _accumulate_from_csr(csr_mat, w_offset: int = 0) -> float:
-            if csr_mat.shape[0] == 0:
-                return 0.0
-            csr = csr_mat.tocsr()
-            start, end = csr.indptr[0], csr.indptr[1]
-            idx = csr.indices[start:end]
-            data = csr.data[start:end]
-            s = 0.0
-            for j, v in zip(idx, data):
-                jj = int(j) + w_offset
-                # guard index bounds in case of mismatch
-                if 0 <= jj < w.shape[0]:
-                    s += float(v) * float(w[jj])
-            return s
-
-        # char features first, then word features with offset
-        score += _accumulate_from_csr(Xc, 0)
-        score += _accumulate_from_csr(Xw, Xc.shape[1])
-
+        score = _linear_score_from_sparse(Xc, Xw, clf)
         return bool(score > 0.0)
     except Exception as e:
         logger.warning("Model inference failed: %s", e)
@@ -262,6 +288,7 @@ def health():
         "status": "ok",
         "model_available": MODEL_AVAILABLE,
         "model_path": MODEL_PATH,
+        "predict_subprocess": PREDICT_IN_SUBPROCESS,
     }
 
 def check_api_key(req: Request, expected_key: str) -> None:
