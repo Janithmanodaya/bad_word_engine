@@ -19,7 +19,14 @@ COPY app.py /app/app.py
 COPY model /app/model
 
 # Default server binding; override via SERVER_URL env var
-ENV SERVER_URL=0.0.0.0:8000
+ENV SERVER_URL=0.0.0.0:8000 \
+    # Tame native BLAS/threads to reduce segfault risk in slim containers
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    # Disable native C-extensions in text matching by default; can override at runtime
+    DISABLE_NATIVE=1
 
 EXPOSE 8000
 
