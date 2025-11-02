@@ -27,6 +27,11 @@ MODEL_PATH: str = ""
 ML_DISABLED: bool = os.getenv("ML_DISABLE", "").strip().lower() in {"1", "true", "yes"}
 # Enable crash-isolated prediction via env var (default off unless set)
 PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "").strip().lower() in {"1", "true", "yes"}
+
+# Persistent worker globals
+_predict_req_q = None
+_predict_resp_q = None
+_predict_proc = None
 _model_bundle = None  # dict with keys: "vec_char", "vec_word", "classifier"
 
 def _preview(text: str, n: int = 140) -> str:
@@ -169,74 +174,152 @@ def _linear_score_from_sparse(Xc, Xw, clf) -> float:
 
     return float(score)
 
-def _predict_worker(model_path: str, text: str, q_out):
+def _predict_worker_loop(model_path: str, q_in, q_out):
     """
-    Child-process worker: load model bundle from disk and produce boolean prediction.
-    Any segfault in sklearn/scipy will only terminate the child, not the server.
+    Persistent child-process worker:
+    - Loads model bundle once
+    - Processes multiple predict requests from q_in and responds on q_out
+    - Input items are dicts: {"id": str, "text": str}
+    - Output items are dicts: {"id": str, "ok": bool, "result": Optional[bool], "error": Optional[str]}
     """
     try:
-        # Prepare namespace and load
         _prepare_unpickle_namespace()
         from joblib import load as joblib_load  # type: ignore
         bundle = joblib_load(model_path)
         vec_char = bundle["vec_char"]
         vec_word = bundle["vec_word"]
         clf = bundle["classifier"]
-
-        Xc = vec_char.transform([text])
-        Xw = vec_word.transform([text])
-
-        # Linear score using sparse accumulation (pure Python path)
-        score = _linear_score_from_sparse(Xc, Xw, clf)
-        q_out.put(bool(score > 0.0))
     except Exception as e:
-        # Communicate failure
+        # Fatal error: report once and exit
         try:
-            q_out.put({"error": str(e)})
+            q_out.put({"id": "__init__", "ok": False, "result": None, "error": f"load_error: {e}"})
         except Exception:
             pass
+        return
+
+    import time as _time
+
+    while True:
+        try:
+            item = q_in.get()
+        except (EOFError, KeyboardInterrupt):
+            break
+        except Exception:
+            # small backoff to avoid busy loop on unexpected errors
+            _time.sleep(0.05)
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        if item.get("cmd") == "shutdown":
+            break
+
+        req_id = item.get("id")
+        text = item.get("text", "")
+
+        try:
+            Xc = vec_char.transform([text])
+            Xw = vec_word.transform([text])
+            score = _linear_score_from_sparse(Xc, Xw, clf)
+            res = bool(score > 0.0)
+            q_out.put({"id": req_id, "ok": True, "result": res, "error": None})
+        except Exception as e:
+            try:
+                q_out.put({"id": req_id, "ok": False, "result": None, "error": str(e)})
+            except Exception:
+                pass
+
+def _ensure_worker_running() -> bool:
+    """
+    Ensure the persistent prediction worker is running. Returns True if running.
+    """
+    global _predict_req_q, _predict_resp_q, _predict_proc
+    if not PREDICT_IN_SUBPROCESS or not MODEL_PATH:
+        return False
+    try:
+        import multiprocessing as mp
+        if _predict_proc is not None:
+            if _predict_proc.is_alive():
+                return True
+            else:
+                try:
+                    _predict_proc.close()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                _predict_proc = None
+                _predict_req_q = None
+                _predict_resp_q = None
+
+        ctx = mp.get_context("spawn")
+        _predict_req_q = ctx.Queue()
+        _predict_resp_q = ctx.Queue()
+        _predict_proc = ctx.Process(target=_predict_worker_loop, args=(MODEL_PATH, _predict_req_q, _predict_resp_q))
+        _predict_proc.daemon = True
+        _predict_proc.start()
+        return True
+    except Exception as e:
+        logger.warning("Failed to start prediction worker: %s", e)
+        _predict_req_q = None
+        _predict_resp_q = None
+        _predict_proc = None
+        return False
+
+
+def _predict_via_worker(text: str) -> Optional[bool]:
+    """
+    Send a prediction request to the persistent worker and wait for response or timeout.
+    """
+    if not _ensure_worker_running():
+        return None
+
+    import time
+    import uuid
+
+    req_id = str(uuid.uuid4())
+    try:
+        _predict_req_q.put({"id": req_id, "text": text})
+    except Exception as e:
+        logger.warning("Failed to enqueue request to worker: %s", e)
+        return None
+
+    timeout_sec = float(os.getenv("PREDICT_TIMEOUT_SEC", "10"))
+    deadline = time.monotonic() + timeout_sec
+    # Poll the response queue for our id
+    while time.monotonic() < deadline:
+        try:
+            msg = _predict_resp_q.get(timeout=0.1)
+        except Exception:
+            continue
+        if isinstance(msg, dict) and msg.get("id") == req_id:
+            if msg.get("ok"):
+                return bool(msg.get("result"))
+            else:
+                logger.warning("Prediction worker error: %s", msg.get("error"))
+                return None
+        # If it's the init error
+        if isinstance(msg, dict) and msg.get("id") == "__init__":
+            logger.warning("Prediction worker init error: %s", msg.get("error"))
+            return None
+
+    logger.warning("Prediction subprocess timed out")
+    return None
+
 
 def model_predict_is_bad(text: str) -> Optional[bool]:
     """
     Return True if model predicts 'bad', False if 'clean', or None if model unavailable or error.
 
     Implementation note:
-    - Avoid dense stack and BLAS-backed dot products which may segfault in slim containers.
-    - Compute the linear decision score manually using sparse nonzeros.
-    - Optionally run prediction inside a subprocess for crash isolation.
+    - Avoid dense ops that may rely on BLAS in minimal containers.
+    - Compute a linear decision score manually from sparse features.
+    - Prefer a persistent subprocess worker to isolate native crashes and avoid repeated model loads.
     """
     if ML_DISABLED or not MODEL_AVAILABLE or (MODEL_PATH == "" and _model_bundle is None):
         return None
 
     if PREDICT_IN_SUBPROCESS and MODEL_PATH:
-        # Isolated execution
-        try:
-            import multiprocessing as mp
-            ctx = mp.get_context("spawn")
-            q = ctx.Queue(maxsize=1)
-            p = ctx.Process(target=_predict_worker, args=(MODEL_PATH, text, q))
-            p.start()
-            p.join(timeout=float(os.getenv("PREDICT_TIMEOUT_SEC", "5")))
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=1)
-                logger.warning("Prediction subprocess timed out")
-                return None
-            # If process crashed with segfault, exitcode will be non-zero
-            if p.exitcode and p.exitcode != 0:
-                logger.warning("Prediction subprocess exited with code %s", p.exitcode)
-                return None
-            try:
-                out = q.get_nowait()
-            except Exception:
-                return None
-            if isinstance(out, dict) and "error" in out:
-                logger.warning("Prediction worker error: %s", out.get("error"))
-                return None
-            return bool(out)
-        except Exception as e:
-            logger.warning("Prediction via subprocess failed: %s", e)
-            return None
+        return _predict_via_worker(text)
 
     # Fallback: in-process safe path (still pure-Python scorer)
     if _model_bundle is None:
@@ -337,6 +420,14 @@ async def lifespan(app: FastAPI):
 
     # Always load ML model (ML-only service)
     load_model()
+
+    # Start persistent prediction worker if configured
+    try:
+        if PREDICT_IN_SUBPROCESS:
+            _ensure_worker_running()
+    except Exception as e:
+        logger.warning("Failed to start prediction worker at startup: %s", e)
+
     try:
         run_startup_smoke_tests()
     except Exception as e:

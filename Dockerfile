@@ -29,7 +29,8 @@ ENV SERVER_URL=0.0.0.0:8000 \
     ML_DISABLE=0 \
     # Run predictions in an isolated subprocess to prevent segfaults from killing the server
     PREDICT_SUBPROCESS=1 \
-    PREDICT_TIMEOUT_SEC=5
+    # First prediction in a fresh worker may take longer due to module import cost
+    PREDICT_TIMEOUT_SEC=15
 
 EXPOSE 8000
 
