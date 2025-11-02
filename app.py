@@ -1,9 +1,8 @@
 # Bad-words detection service (FastAPI) — ML-only version
-# This rewrite removes all lexicon/fuzzy/substring systems and relies solely on the bundled ML model.
-# The model is loaded from model/model.joblib (or discovered paths), and inference is performed with
-# a safe, sparse, Python-level linear scorer to avoid native BLAS/segfaults in minimal containers.
-# Additionally, for maximal stability, prediction can be executed in a separate subprocess so that
-# any native crashes in scipy/sklearn cannot bring down the main server.
+# Optimized for low-resource servers (≈0.2 vCPU, 256MB RAM).
+# - Lightweight inference using sparse linear scorer (pure Python)
+# - Optional subprocess isolation to contain native crashes
+# - Tunable startup behavior to avoid heavy runtime installations/smoke tests
 
 import os
 import logging
@@ -25,8 +24,11 @@ logger = logging.getLogger("badwords_service_ml")
 MODEL_AVAILABLE: bool = False
 MODEL_PATH: str = ""
 ML_DISABLED: bool = os.getenv("ML_DISABLE", "").strip().lower() in {"1", "true", "yes"}
-# Enable crash-isolated prediction via env var (default off unless set)
-PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "").strip().lower() in {"1", "true", "yes"}
+# Enable crash-isolated prediction via env var
+PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "1").strip().lower() in {"1", "true", "yes"}
+# Reduce startup work on constrained hosts
+LOW_RESOURCE_MODE: bool = os.getenv("LOW_RESOURCE_MODE", "1").strip().lower() in {"1", "true", "yes"}
+RUNTIME_DEPS_INSTALL: bool = os.getenv("RUNTIME_DEPS_INSTALL", "0").strip().lower() in {"1", "true", "yes"}
 _model_bundle = None  # dict with keys: "vec_char", "vec_word", "classifier"
 
 # Subprocess prediction worker globals
@@ -340,9 +342,13 @@ def model_predict_is_bad(text: str) -> Optional[bool]:
 
 def ensure_runtime_dependencies() -> None:
     """
-    Check and install any missing runtime libraries required for inference.
-    Intended for container environments where a dependency may be absent.
+    Optionally check and install runtime libraries.
+    Disabled by default for low-resource servers to avoid pip activity at startup.
+    Enable with env RUNTIME_DEPS_INSTALL=1 if absolutely necessary.
     """
+    if not RUNTIME_DEPS_INSTALL:
+        return
+
     import importlib.util as _ilu
     import subprocess as _sp
     import sys as _sys
@@ -412,18 +418,21 @@ class DefaultResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Ensure required libs exist (attempt install if missing), then load model and run smoke tests
+    # Minimal startup on low-resource servers
     try:
         ensure_runtime_dependencies()
     except Exception as e:
         logger.warning("Dependency check/install encountered an issue: %s", e)
 
-    # Always load ML model (ML-only service)
+    # Load ML model
     load_model()
-    try:
-        run_startup_smoke_tests()
-    except Exception as e:
-        logger.warning("Startup smoke tests encountered an issue: %s", e)
+
+    # Optionally run smoke tests (disabled by default in low-resource mode)
+    if not LOW_RESOURCE_MODE:
+        try:
+            run_startup_smoke_tests()
+        except Exception as e:
+            logger.warning("Startup smoke tests encountered an issue: %s", e)
 
     logger.info("Startup complete. MODEL_AVAILABLE=%s", MODEL_AVAILABLE)
     yield
