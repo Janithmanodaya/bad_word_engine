@@ -13,15 +13,23 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 
 # Optional accelerated libraries
+# Allow disabling native extensions via env to avoid segfaults in constrained containers
+_disable_native = os.getenv("DISABLE_NATIVE", "0").lower() in {"1", "true", "yes"}
+
 try:
+    if _disable_native:
+        raise ImportError("Disabled by env")
     import ahocorasick  # type: ignore
     HAS_AHO = True
 except Exception:
     HAS_AHO = False
 
 try:
+    if _disable_native:
+        raise ImportError("Disabled by env")
     from rapidfuzz import fuzz, process  # type: ignore
     HAS_RAPIDFUZZ = True
 except Exception:
@@ -789,14 +797,20 @@ class AdvancedResponse(BaseModel):
     bad_words: List[str]
 
 
-app = FastAPI()
-
-
-@app.on_event("startup")
-def on_startup():
-    load_model()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    if os.getenv("ML_DISABLE", "0").lower() in {"1", "true", "yes"}:
+        logger.info("ML_DISABLE set; skipping ML model load.")
+    else:
+        load_model()
     init_lexicons()
     logger.info("Startup complete. MODEL_AVAILABLE=%s", MODEL_AVAILABLE)
+    yield
+    # Shutdown
+    # No resources to cleanup currently.
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")
