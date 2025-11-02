@@ -29,6 +29,11 @@ ML_DISABLED: bool = os.getenv("ML_DISABLE", "").strip().lower() in {"1", "true",
 PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "").strip().lower() in {"1", "true", "yes"}
 _model_bundle = None  # dict with keys: "vec_char", "vec_word", "classifier"
 
+# Subprocess prediction worker globals
+_predict_req_q = None
+_predict_resp_q = None
+_predict_proc = None
+
 def _preview(text: str, n: int = 140) -> str:
     return text if len(text) <= n else text[:n] + "...(truncated)"
 
@@ -406,76 +411,3 @@ class DefaultResponse(BaseModel):
     found: bool
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Ensure required libs exist (attempt install if missing), then load model and run smoke tests
-    try:
-        ensure_runtime_dependencies()
-    except Exception as e:
-        logger.warning("Dependency check/install encountered an issue: %s", e)
-
-    # Always load ML model (ML-only service)
-    load_model()
-    try:
-        run_startup_smoke_tests()
-    except Exception as e:
-        logger.warning("Startup smoke tests encountered an issue: %s", e)
-
-    logger.info("Startup complete. MODEL_AVAILABLE=%s", MODEL_AVAILABLE)
-    yield
-    # No teardown required.
-
-app = FastAPI(lifespan=lifespan)
-
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "bad-words service (ml-only)"}
-
-@app.get("/favicon.ico")
-def favicon():
-    # Avoid noisy 404s for browsers requesting a favicon
-    return Response(status_code=204)
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "model_available": MODEL_AVAILABLE,
-        "model_path": MODEL_PATH,
-        "predict_subprocess": PREDICT_IN_SUBPROCESS,
-    }
-
-def check_api_key(req: Request, expected_key: str) -> None:
-    key = req.headers.get("X-API-Key", "")
-    if expected_key and key != expected_key:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-@app.post("/check")
-async def check_default(req: Request, payload: CheckRequest):
-    api_key = os.getenv("API_KEY", "")
-    check_api_key(req, api_key)
-
-    text_preview = _preview(payload.text)
-    logger.info("Incoming /check (ml-only): text_preview=%s", text_preview)
-
-    res = model_predict_is_bad(payload.text)
-    if res is None:
-        # ML-only service: if model not available or error during inference, return 503
-        raise HTTPException(status_code=503, detail="Model unavailable")
-
-    return DefaultResponse(found=bool(res))
-
-# Backward/compat alias for clients calling /check/check
-@app.post("/check/check")
-async def check_default_alias(req: Request, payload: CheckRequest):
-    return await check_default(req, payload)
-
-# __main__
-if __name__ == "__main__":
-    import uvicorn
-    port_env = os.getenv("PORT")
-    try:
-        port = int(port_env) if port_env and port_env.isdigit() else 8000
-    except Exception:
-        port = 8000
-    host = os.getenv("HOST", "0.0.0.0")
-    uvicorn.run("app:app", host=host, port=port, reload=False)
