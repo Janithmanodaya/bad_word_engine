@@ -445,7 +445,7 @@ async def lifespan(app: FastAPI):
         logger.warning("Dependency check/install encountered an issue: %s", e)
 
     # Skip eager model load; enable lazy loading on first /check call to reduce startup CPU/RAM.
-    logger.info("Startup complete. Lazy model loading enabled. MODEL_AVAILABLE=%s", MODEL_tests()
+    logger.info("Startup complete. Lazy model loading enabled. MODEL_AVAILABLE=%s", MODEL_AVAILABLE)
         except Exception as e:
             logger.warning("Startup smoke tests encountered an issue: %s", e)
 
@@ -491,11 +491,7 @@ async def check_default(req: Request, payload: CheckRequest):
         text_in = text_in[:MAX_TEXT_LEN]
 
     text_preview = _preview(text_in)
-    logger.info("Incoming /check (ml-only): text_preview=%s", text_preview)
-
-    res = model_predict_is_bad(text_in)
-    if res is None:
-        # ML-only service: if model not available or error during inference, return 503
+    logger.info("Incoming /check (ml-only): textnce, return 503
         raise HTTPException(status_code=503, detail="Model unavailable")
 
     return DefaultResponse(found=bool(res))
