@@ -485,10 +485,15 @@ async def check_default(req: Request, payload: CheckRequest):
     api_key = os.getenv("API_KEY", "")
     check_api_key(req, api_key)
 
-    text_preview = _preview(payload.text)
+    # Enforce max text length to reduce CPU/memory pressure
+    text_in = payload.text or ""
+    if len(text_in) > MAX_TEXT_LEN:
+        text_in = text_in[:MAX_TEXT_LEN]
+
+    text_preview = _preview(text_in)
     logger.info("Incoming /check (ml-only): text_preview=%s", text_preview)
 
-    res = model_predict_is_bad(payload.text)
+    res = model_predict_is_bad(text_in)
     if res is None:
         # ML-only service: if model not available or error during inference, return 503
         raise HTTPException(status_code=503, detail="Model unavailable")
