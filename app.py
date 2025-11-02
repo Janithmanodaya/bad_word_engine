@@ -702,6 +702,18 @@ def model_predict_is_bad(text: str) -> Optional[bool]:
         Xw_dense = Xw.toarray()
         X = _np.hstack([Xc_dense, Xw_dense])
 
+        # Prefer a pure-NumPy linear decision path if available (avoids libsvm/liblinear native code)
+        if hasattr(clf, "coef_") and hasattr(clf, "intercept_"):
+            coef = getattr(clf, "coef_", None)
+            intercept = getattr(clf, "intercept_", None)
+            if coef is not None and intercept is not None:
+                # Binary classification expected => coef shape (1, n_features)
+                scores = X.dot(coef.T) + intercept
+                # Convert to 1D
+                score = float(scores.ravel()[0])
+                return bool(score > 0.0)
+
+        # Fallback to sklearn predict if linear path not available
         y_pred = clf.predict(X)
         return bool(int(y_pred[0]) == 1)
     except Exception as e:
