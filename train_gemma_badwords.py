@@ -708,7 +708,7 @@ def main():
         try:
             ensure_dependencies()
         except Exception as e:
-            logging.warning("Dependency setup")
+            logging.warning("Dependency setup encountered an issue: %s", e)
 
     # Fresh start
     if args.fresh_start and os.path.isdir(args.output_dir):
