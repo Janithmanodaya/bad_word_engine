@@ -26,7 +26,13 @@ MODEL_PATH: str = ""
 ML_DISABLED: bool = os.getenv("ML_DISABLE", "").strip().lower() in {"1", "true", "yes"}
 # Enable crash-isolated prediction via env var.
 # Default OFF to avoid heavy fork+reload overhead on tiny servers (0.2 vCPU / 256–512MB RAM).
-PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "0").strip().lower() in {"1", "true", "yes"}
+# Support both PREDICT_SUBPROCESS and PREDICT_IN_SUBPROCESS env names (latter is more explicit).
+PREDICT_IN_SUBPROCESS: bool = (
+    os.getenv("PREDICT_SUBPROCESS", os.getenv("PREDICT_IN_SUBPROCESS", "0"))
+    .strip()
+    .lower()
+    in {"1", "true", "yes"}
+)
 # Reduce startup work on constrained hosts
 LOW_RESOURCE_MODE: bool = os.getenv("LOW_RESOURCE_MODE", "1").strip().lower() in {"1", "true", "yes"}
 RUNTIME_DEPS_INSTALL: bool = os.getenv("RUNTIME_DEPS_INSTALL", "0").strip().lower() in {"1", "true", "yes"}
@@ -473,6 +479,12 @@ async def lifespan(app: FastAPI):
         ensure_runtime_dependencies()
     except Exception as e:
         logger.warning("Dependency check/install encountered an issue: %s", e)
+
+    # Force model load at startup so the first request doesn't pay the cost.
+    try:
+        load_model()
+    except Exception as e:
+        logger.warning("Model load during startup encountered an issue: %s", e)
 
     # Optionally run quick smoke tests when not in low-resource mode.
     try:
