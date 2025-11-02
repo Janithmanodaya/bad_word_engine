@@ -47,4 +47,4 @@ EXPOSE 8000
 # - no access log
 # - short keep-alive timeout
 # - limited concurrency
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --no-access-log --timeout-keep-alive 5 --limit-concurrency 16"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --loop asyncio --no-access-log --timeout-keep-alive 5 --limit-concurrency 16"]
