@@ -30,6 +30,8 @@ PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "0").strip().lower
 # Reduce startup work on constrained hosts
 LOW_RESOURCE_MODE: bool = os.getenv("LOW_RESOURCE_MODE", "1").strip().lower() in {"1", "true", "yes"}
 RUNTIME_DEPS_INSTALL: bool = os.getenv("RUNTIME_DEPS_INSTALL", "0").strip().lower() in {"1", "true", "yes"}
+# Cap input length to avoid excessive CPU/memory on very long texts
+MAX_TEXT_LEN: int = int(os.getenv("MAX_TEXT_LEN", "4000"))
 _model_bundle = None  # dict with keys: "vec_char", "vec_word", "classifier"
 
 # Subprocess prediction worker globals
@@ -140,6 +142,19 @@ def load_model() -> None:
         logger.error("Failed to load ML model from %s: %s", model_file, e)
         MODEL_AVAILABLE = False
         _model_bundle = None
+
+
+def ensure_model_loaded() -> bool:
+    """
+    Lazily load the ML model on first use to avoid heavy startup cost.
+    Returns True if model is available after this call.
+    """
+    if ML_DISABLED:
+        return False
+    if MODEL_AVAILABLE and (_model_bundle is not None or MODEL_PATH):
+        return True
+    load_model()
+    return bool(MODEL_AVAILABLE)
 
 def _linear_score_from_sparse(Xc, Xw, clf) -> float:
     """
@@ -318,7 +333,11 @@ def model_predict_is_bad(text: str) -> Optional[bool]:
     - Compute a linear decision score manually from sparse features.
     - Prefer a persistent subprocess worker to isolate native crashes and avoid repeated model loads.
     """
-    if ML_DISABLED or not MODEL_AVAILABLE or (MODEL_PATH == "" and _model_bundle is None):
+    if ML_DISABLED:
+        return None
+
+    # Ensure model is loaded (lazy)
+    if not ensure_model_loaded():
         return None
 
     if PREDICT_IN_SUBPROCESS and MODEL_PATH:
@@ -425,13 +444,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Dependency check/install encountered an issue: %s", e)
 
-    # Load ML model
-    load_model()
-
-    # Optionally run smoke tests (disabled by default in low-resource mode)
-    if not LOW_RESOURCE_MODE:
-        try:
-            run_startup_smoke_tests()
+    # Skip eager model load; enable lazy loading on first /check call to reduce startup CPU/RAM.
+    logger.info("Startup complete. Lazy model loading enabled. MODEL_AVAILABLE=%s", MODEL_tests()
         except Exception as e:
             logger.warning("Startup smoke tests encountered an issue: %s", e)
 
