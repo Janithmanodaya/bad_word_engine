@@ -25,7 +25,8 @@ logger = logging.getLogger("badwords_service_ml")
 MODEL_AVAILABLE: bool = False
 MODEL_PATH: str = ""
 ML_DISABLED: bool = os.getenv("ML_DISABLE", "").strip().lower() in {"1", "true", "yes"}
-PREDICT_IN_SUBPROCESS: bool = False
+# Enable crash-isolated prediction via env var (default off unless set)
+PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "").strip().lower() in {"1", "true", "yes"}
 _model_bundle = None  # dict with keys: "vec_char", "vec_word", "classifier"
 
 def _preview(text: str, n: int = 140) -> str:
