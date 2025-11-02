@@ -23,4 +23,4 @@ ENV SERVER_URL=0.0.0.0:8000
 
 EXPOSE 8000
 
-CMD ["python", "app.py"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
