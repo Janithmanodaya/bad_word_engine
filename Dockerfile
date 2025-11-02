@@ -30,10 +30,10 @@ ENV SERVER_URL=0.0.0.0:8000 \
     # Low-resource defaults
     LOW_RESOURCE_MODE=1 \
     RUNTIME_DEPS_INSTALL=0 \
-    # Enable subprocess isolation for predictions to prevent main-process segfaults
-    PREDICT_SUBPROCESS=1 \
+    # Subprocess isolation disabled by default for 0.2 vCPU stability (can enable with PREDICT_SUBPROCESS=1)
+    PREDICT_SUBPROCESS=0 \
     # Timeout only applies when subprocess mode is enabled
-    PREDICT_TIMEOUT_SEC=10
+    PREDICT_TIMEOUT_SEC=30
 
 EXPOSE 8000
 
