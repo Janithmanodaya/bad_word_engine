@@ -27,11 +27,19 @@ ENV SERVER_URL=0.0.0.0:8000 \
     NUMEXPR_NUM_THREADS=1 \
     # Enable ML by default; can disable via ML_DISABLE=1 at runtime
     ML_DISABLE=0 \
+    # Low-resource defaults
+    LOW_RESOURCE_MODE=1 \
+    RUNTIME_DEPS_INSTALL=0 \
     # Enable subprocess isolation for predictions to prevent main-process segfaults
     PREDICT_SUBPROCESS=1 \
     # Timeout only applies when subprocess mode is enabled
-    PREDICT_TIMEOUT_SEC=30
+    PREDICT_TIMEOUT_SEC=10
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Uvicorn tuned for constrained CPU/RAM:
+# - single worker
+# - no access log
+# - short keep-alive timeout
+# - limited concurrency
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --no-access-log --timeout-keep-alive 5 --limit-concurrency 16"]
