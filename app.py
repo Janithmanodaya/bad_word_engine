@@ -27,11 +27,6 @@ MODEL_PATH: str = ""
 ML_DISABLED: bool = os.getenv("ML_DISABLE", "").strip().lower() in {"1", "true", "yes"}
 # Enable crash-isolated prediction via env var (default off unless set)
 PREDICT_IN_SUBPROCESS: bool = os.getenv("PREDICT_SUBPROCESS", "").strip().lower() in {"1", "true", "yes"}
-
-# Persistent worker globals
-_predict_req_q = None
-_predict_resp_q = None
-_predict_proc = None
 _model_bundle = None  # dict with keys: "vec_char", "vec_word", "classifier"
 
 def _preview(text: str, n: int = 140) -> str:
@@ -420,14 +415,6 @@ async def lifespan(app: FastAPI):
 
     # Always load ML model (ML-only service)
     load_model()
-
-    # Start persistent prediction worker if configured
-    try:
-        if PREDICT_IN_SUBPROCESS:
-            _ensure_worker_running()
-    except Exception as e:
-        logger.warning("Failed to start prediction worker at startup: %s", e)
-
     try:
         run_startup_smoke_tests()
     except Exception as e:
